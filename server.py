@@ -94,7 +94,7 @@ import numpy as np
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from scipy import stats as scipy_stats
 from sklearn.calibration import CalibratedClassifierCV
@@ -894,30 +894,42 @@ def ingest_single_txn(client: SumsubClient, txn_id: str) -> dict | None:
     return row
 
 
-def import_txn_ids(client: SumsubClient, txn_ids: list[str]) -> dict:
+def import_txn_ids(client: SumsubClient, txn_ids: list[str], on_progress=None) -> dict:
     """Bulk-import by transaction ID -- the honest bridge for historical
-    "bank rfi" data. Sumsub's public API has no endpoint that lists/searches
-    transactions by tag (confirmed against their docs: the only query
-    endpoint is Travel-Rule/crypto-only, and there's no general "list
-    transactions" or "filter by tag" API). Their DASHBOARD does let you
-    filter/search transactions by tag, though, so the intended flow is:
-    filter by "bank rfi" in the Sumsub Dashboard, copy the transaction IDs
-    shown there, and paste them in here -- OR pull IDs from your own
-    records (a Slack thread, a spreadsheet of transfer IDs, whatever you've
-    got) since ingest_single_txn() accepts EITHER Sumsub's internal ID or
-    your own system's external ID for each transaction and figures out
-    which one it got. Every ID is then resolved through a real Sumsub API
-    call (get_transaction/get_transaction_by_external_id + get_txn_tags +
+    data Sumsub's API can't enumerate on its own. Confirmed against Sumsub's
+    docs (Get Started with API, the KYT developer guide, Find Specific TR
+    Transactions, Export Case Data, Transaction Monitoring Analytics): there
+    is NO endpoint that lists/searches/exports all KYT transactions --
+    the only documented query endpoint only returns Travel-Rule/crypto-type
+    transactions, and dashboard CSV export is a UI-only feature. This
+    applies to "give me every transaction" just as much as "give me every
+    bank-rfi transaction" -- neither is possible via a raw API call.
+
+    So the same bridge covers both cases: filter/export transaction IDs
+    from the Sumsub DASHBOARD (filter by "bank rfi" tag for just those, or
+    export/list with no tag filter for literally everything you want
+    monitored) and paste them in here -- OR pull IDs from your own records
+    (a spreadsheet of transfer IDs, whatever you've got), since
+    ingest_single_txn() accepts EITHER Sumsub's internal ID or your own
+    system's external ID for each one and figures out which it got. Every
+    ID is then resolved through a real Sumsub API call
+    (get_transaction/get_transaction_by_external_id + get_txn_tags +
     get_txn_notes) -- nothing here is synthetic or guessed, this just tells
     the bot which real transactions to go fetch since Sumsub won't let it
-    discover them on its own."""
+    discover them on its own.
+
+    `on_progress(done, total)` is called after every ID so a caller (the
+    background job below) can report live status for large lists."""
     scanned = new_rfi = failed = 0
     details = []  # per-ID diagnostics -- exactly which tags Sumsub returned for
     # each one, so a mismatch (wrong tag spelling, wrong ID, transaction not
     # found) is visible immediately instead of a silent "0 imported".
-    for txn_id in txn_ids:
+    total = len(txn_ids)
+    for i, txn_id in enumerate(txn_ids):
         txn_id = (txn_id or "").strip()
         if not txn_id:
+            if on_progress:
+                on_progress(i + 1, total)
             continue
         row = ingest_single_txn(client, txn_id)
         if row:
@@ -928,6 +940,8 @@ def import_txn_ids(client: SumsubClient, txn_ids: list[str]) -> dict:
         else:
             failed += 1
             details.append({"txn_id": txn_id, "found": False, "tags": [], "is_bank_rfi": False})
+        if on_progress:
+            on_progress(i + 1, total)
     return {"strategy": "manual_id_import", "ran": scanned > 0, "scanned": scanned,
             "new_bank_rfi": new_rfi, "failed": failed, "total_ids": len(txn_ids), "details": details}
 
@@ -1053,6 +1067,10 @@ init_db()
 _current_bundle: ModelBundle | None = None
 _client: SumsubClient | None = None
 _connection_cache = {"checked_at": None, "status": "unknown", "detail": ""}
+# Tracks the most recent bulk ID import so large pastes (e.g. "every
+# transaction", not just bank-rfi ones) don't have to finish inside a
+# single HTTP request -- see api_import_ids / api_import_status.
+_import_job = {"running": False, "done": 0, "total": 0, "result": None, "started_at": None, "finished_at": None}
 
 
 def get_client() -> SumsubClient | None:
@@ -1256,19 +1274,43 @@ def api_trigger_ingest():
     return {"status": "completed", "summary": api_summary()}
 
 
+def _run_import_job_in_background(client: SumsubClient, raw_ids: list[str]):
+    def on_progress(done, total):
+        _import_job["done"] = done
+        _import_job["total"] = total
+    try:
+        result = import_txn_ids(client, raw_ids, on_progress=on_progress)
+        retrain_only()  # each ID was already fetched for real above; just retrain on the updated data now
+        _import_job["result"] = result
+    except Exception as e:  # noqa: BLE001 - a bad ID list must not wedge the job state
+        logger.exception("Bulk import job failed")
+        _import_job["result"] = {"error": str(e)}
+    finally:
+        _import_job["running"] = False
+        _import_job["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
 @app.post("/api/ingest/import-ids")
-async def api_import_ids(request: Request):
-    """Manual bridge for getting HISTORICAL "bank rfi" data in, since
-    Sumsub's public API has no endpoint to list/search transactions by tag
-    (see import_txn_ids docstring for what was checked). Filter by "bank
-    rfi" in the Sumsub Dashboard, copy the transaction IDs it shows, and
-    paste them here (or POST {"txn_ids": [...]}) -- each one is then fetched
-    for real via the Sumsub API, nothing is fabricated."""
+async def api_import_ids(request: Request, background_tasks: BackgroundTasks):
+    """Manual bridge for getting data in that Sumsub's API can't enumerate
+    on its own -- whether that's specifically "bank rfi"-tagged transactions
+    or literally every transaction you want monitored (see import_txn_ids
+    docstring for exactly what was checked and why no API shortcut exists).
+    Filter/export transaction IDs from the Sumsub Dashboard and paste them
+    here (or POST {"txn_ids": [...]}) -- each one is then fetched for real
+    via the Sumsub API, nothing is fabricated.
+
+    Runs as a BACKGROUND JOB rather than blocking this request: a list of a
+    few hundred or thousand IDs (e.g. "all transactions", not just the
+    handful tagged bank-rfi) can take minutes to resolve one API call at a
+    time, which would otherwise hit Render's/uvicorn's request timeout and
+    fail the whole batch. Poll GET /api/ingest/import-status for progress."""
     body = await request.json()
     raw_ids = body.get("txn_ids")
     if raw_ids is None:
         text = body.get("text", "") or ""
         raw_ids = [x for x in re.split(r"[,\s]+", text) if x]
+    raw_ids = [x for x in (raw_ids or []) if (x or "").strip()]
     client = get_client()
     if client is None:
         return JSONResponse(
@@ -1277,38 +1319,68 @@ async def api_import_ids(request: Request):
         )
     if not raw_ids:
         return JSONResponse({"error": "No transaction IDs provided."}, status_code=400)
-    result = import_txn_ids(client, raw_ids)
-    retrain_only()  # each ID was already fetched for real above; just retrain on the updated data now
-    return {"import_result": result, "summary": api_summary()}
+    if _import_job["running"]:
+        return JSONResponse(
+            {"error": "An import is already running -- check /api/ingest/import-status and wait for it to finish."},
+            status_code=409,
+        )
+    _import_job.update(running=True, done=0, total=len(raw_ids), result=None,
+                        started_at=datetime.now(timezone.utc).isoformat(), finished_at=None)
+    background_tasks.add_task(_run_import_job_in_background, client, raw_ids)
+    return {"status": "started", "total_ids": len(raw_ids)}
 
 
-@app.post("/api/webhooks/sumsub")
-async def api_sumsub_webhook(request: Request):
-    """Register this URL in Sumsub Dashboard -> Settings -> Webhooks for
-    Transaction Monitoring events."""
-    event = await request.json()
-    # Record receipt unconditionally (even without credentials or a
-    # recognizable txn id) so the Setup panel can confirm "yes, Sumsub is
-    # reaching this URL" independently of whether ingestion succeeds.
-    record_webhook_event(event.get("type", "unknown"), event.get("kytTxnId") or event.get("txnId") or "unknown", event)
+@app.get("/api/ingest/import-status")
+def api_import_status():
+    """Poll this while a bulk import (started via POST .../import-ids) is
+    running to show live progress instead of a frozen "loading" spinner."""
+    return {**_import_job, "summary": api_summary() if not _import_job["running"] else None}
+
+
+def _process_webhook_event_in_background(event: dict):
+    """Runs AFTER the HTTP response has already been sent (see
+    api_sumsub_webhook) -- this is what actually fetches the transaction and
+    retrains. Keeping it out of the request/response path matters: Sumsub's
+    webhook delivery (and its "Test webhook" button) times out waiting for a
+    response after only a few seconds, and fetching a transaction (1-3
+    Sumsub API calls) plus a full model retrain can easily take longer than
+    that, especially as the dataset grows. Doing this synchronously in the
+    handler caused Sumsub to report "Could not get response" even though
+    the server was working correctly -- it just answered too late."""
     client = get_client()
     if client is None:
         logger.warning("Webhook received but credentials aren't set yet: %s", event)
-        return {"received": True, "processed": False, "reason": "credentials not configured"}
+        return
     try:
         row = process_webhook_event(client, event)
         if row:
-            # Retrain immediately on EVERY real transaction event -- tagged
-            # "bank rfi" or not -- so the model, the candidate pool, and the
-            # pattern stats are current within seconds of Sumsub sending
-            # this event. This is the bot's actual "constantly running"
-            # mechanism; the hourly job is only a safety net (see
-            # run_ingest_and_retrain's docstring).
+            # Retrain on EVERY real transaction event -- tagged "bank rfi"
+            # or not -- so the model, the candidate pool, and the pattern
+            # stats are current within seconds of Sumsub sending this event.
+            # This is the bot's actual "constantly running" mechanism; the
+            # hourly job is only a safety net (see run_ingest_and_retrain's
+            # docstring).
             tag_note = "new bank-rfi transaction" if row.get("is_bank_rfi") else "transaction update"
             logger.info("Webhook event processed (%s): %s -- retraining now", tag_note, row["txn_id"])
             retrain_only()
     except Exception:
         logger.exception("Failed to process webhook event: %s", event)
+
+
+@app.post("/api/webhooks/sumsub")
+async def api_sumsub_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Register this URL in Sumsub Dashboard -> Settings -> Webhooks for
+    Transaction Monitoring events. Responds immediately (see
+    _process_webhook_event_in_background for why that matters) -- the
+    actual fetch-and-retrain work happens after the response is sent."""
+    event = await request.json()
+    # Record receipt unconditionally (even without credentials or a
+    # recognizable txn id) so the Setup panel can confirm "yes, Sumsub is
+    # reaching this URL" independently of whether ingestion succeeds. This
+    # is a single fast local DB write, not an API call, so it's safe to do
+    # before responding.
+    record_webhook_event(event.get("type", "unknown"), event.get("kytTxnId") or event.get("txnId") or "unknown", event)
+    background_tasks.add_task(_process_webhook_event_in_background, event)
     return {"received": True}
 
 
@@ -1420,19 +1492,29 @@ FRONTEND_HTML = r"""<!doctype html>
     <section id="setupBanner" style="display:none;"></section>
 
     <details class="section-collapse" id="importSection">
-      <summary>Import known &ldquo;bank rfi&rdquo; transactions by ID</summary>
+      <summary>Import transactions by ID (works for &ldquo;bank rfi&rdquo; ones, or literally all of them)</summary>
       <div class="details-body">
         <p class="desc">
-          Sumsub's API has no endpoint to list or search transactions by tag &mdash;
-          but the Sumsub <strong>Dashboard</strong> does let you filter transactions
-          by tag. Filter for &ldquo;bank rfi&rdquo; there, copy the transaction IDs it
-          shows, and paste them below &mdash; or paste IDs straight from your own
-          records (a spreadsheet, a Slack thread) instead, since either Sumsub's own
-          transaction ID or your system's external/transfer ID works here, the bot
-          tries both automatically. Each one is then fetched for real from the
-          Sumsub API (full details, tags, notes) &mdash; nothing here is guessed or
-          made up, this just tells the bot which real transactions to go get, since
-          Sumsub won't let it discover them on its own.
+          Sumsub's API has no endpoint to list, search, or export all KYT
+          transactions &mdash; confirmed against their docs, and this isn't limited
+          to tag filtering: the only documented transaction-query endpoint only
+          returns Travel-Rule/crypto-type transactions, so the automatic hourly
+          safety-net sweep can only ever find <em>that</em> subset on its own (if
+          you've seen a low "scanned" number like 7 in the ingestion history below,
+          that's the full count of Travel-Rule-type transactions on your account,
+          not a bug &mdash; the rest genuinely can't be enumerated via API).
+        </p>
+        <p class="desc">
+          The <strong>Dashboard</strong> is the way around that for both cases: filter
+          by &ldquo;bank rfi&rdquo; there for just those, or open the transactions list /
+          export with no tag filter to get IDs for <strong>every</strong> transaction you
+          want monitored, then paste the list below. You can also paste IDs straight
+          from your own records (a spreadsheet, a Slack thread) &mdash; either Sumsub's
+          own transaction ID or your system's external/transfer ID works, the bot
+          tries both automatically. Each one is then fetched for real from the Sumsub
+          API (full details, tags, notes) &mdash; nothing here is guessed or made up.
+          Large lists run as a background job so the page won't time out; progress
+          updates live below.
         </p>
         <textarea id="importIdsText" rows="4" placeholder="One transaction ID per line, or comma-separated -- Sumsub's own ID or your system's external/transfer ID both work"></textarea>
         <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
@@ -1546,9 +1628,9 @@ function renderSetup(s) {
       + `<br/><code class="copyline"><span>${s.webhook_url}</span><button onclick="copyToClipboard('${s.webhook_url}', this)">Copy</button></code>`
   });
   if (s.total_transactions === 0) {
-    rows.push({icon: "warn", text: `<strong>No data yet.</strong> All data comes straight from the Sumsub API -- either wait for "${s.bank_rfi_tag}"-tagged transactions to arrive via the webhook above, or use "Import known &lsquo;bank rfi&rsquo; transactions by ID" below (Sumsub's API can't list transactions by tag, but its Dashboard can filter by tag -- that's the fastest way to backfill history).`});
+    rows.push({icon: "warn", text: `<strong>No data yet.</strong> All data comes straight from the Sumsub API -- either wait for transaction events to arrive via the webhook above, or use "Import transactions by ID" below (Sumsub's API can't list/export transactions at all, tagged or not, but its Dashboard can filter and show IDs -- that's the fastest way to backfill history, for "${s.bank_rfi_tag}"-tagged ones or every transaction you want monitored).`});
   } else if (s.total_bank_rfi === 0) {
-    rows.push({icon: "warn", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested, but none tagged "${s.bank_rfi_tag}" yet.</strong> If you know some already carry that tag in Sumsub, use "Import known &lsquo;bank rfi&rsquo; transactions by ID" below -- filter by "${s.bank_rfi_tag}" in the Sumsub Dashboard, copy the IDs it shows, and paste them there. Sumsub's API has no way to list transactions by tag on its own, so this is the fastest way in.`});
+    rows.push({icon: "warn", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested, but none tagged "${s.bank_rfi_tag}" yet.</strong> If you know some already carry that tag in Sumsub, use "Import transactions by ID" below -- filter by "${s.bank_rfi_tag}" in the Sumsub Dashboard, copy the IDs it shows, and paste them there. Sumsub's API has no way to list transactions by tag (or at all) on its own, so this is the fastest way in.`});
   } else {
     rows.push({icon: "good", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested</strong>, ${s.total_bank_rfi.toLocaleString()} tagged "${s.bank_rfi_tag}" so far -- all pulled from the Sumsub API. The model retrains immediately every time a webhook event comes in (not on a timer); a safety-net sweep also runs every ${s.ingest_interval_minutes} minute(s) in case any webhook delivery was missed.`});
   }
@@ -1663,6 +1745,48 @@ document.getElementById("refreshBtn").addEventListener("click", async (e) => {
   }
 });
 
+function renderImportDetails(details) {
+  const detailsEl = document.getElementById("importDetails");
+  const rows = (details || []).map(d => {
+    if (!d.found) return `<div style="margin:4px 0;"><span class="pill">${d.txn_id}</span> <span style="color:var(--status-critical);">not found -- checked both Sumsub's internal ID and your system's external ID, verify it's correct and credentials have access to it</span></div>`;
+    const tagList = d.tags.length ? d.tags.map(t => `<span class="pill">${t}</span>`).join(" ") : '<em style="color:var(--text-muted);">no tags on this transaction</em>';
+    const verdict = d.is_bank_rfi
+      ? '<span style="color:var(--status-good); font-weight:600;">matched "bank rfi"</span>'
+      : '<span style="color:var(--text-muted);">no "bank rfi" tag found</span>';
+    return `<div style="margin:4px 0;"><span class="pill">${d.txn_id}</span> ${verdict} &mdash; tags: ${tagList}</div>`;
+  }).join("");
+  detailsEl.innerHTML = rows ? `<div class="desc" style="margin-bottom:6px;">What Sumsub actually returned for each ID:</div>${rows}` : "";
+}
+
+async function pollImportStatus(btn, statusEl) {
+  while (true) {
+    await new Promise(r => setTimeout(r, 1500));
+    let s;
+    try {
+      s = await (await fetch("/api/ingest/import-status")).json();
+    } catch (err) {
+      statusEl.textContent = "Lost track of import progress: " + err;
+      break;
+    }
+    if (s.running) {
+      statusEl.textContent = `Importing… ${s.done} of ${s.total} transactions fetched from Sumsub so far. This can take a while for large lists -- one real API call per ID -- feel free to leave this open.`;
+      continue;
+    }
+    // Finished (or a job someone else started already finished) -- show the result.
+    if (s.result && s.result.error) {
+      statusEl.textContent = "Import failed: " + s.result.error;
+    } else if (s.result) {
+      const r = s.result;
+      statusEl.textContent = `Imported ${r.scanned} of ${r.total_ids} (${r.new_bank_rfi} tagged "bank rfi", ${r.failed} failed).`;
+      renderImportDetails(r.details);
+    }
+    await loadAll();
+    break;
+  }
+  btn.disabled = false;
+  btn.textContent = "Import these transactions";
+}
+
 document.getElementById("importBtn").addEventListener("click", async (e) => {
   const btn = e.target;
   const statusEl = document.getElementById("importStatus");
@@ -1681,24 +1805,15 @@ document.getElementById("importBtn").addEventListener("click", async (e) => {
     const data = await resp.json();
     if (!resp.ok) {
       statusEl.textContent = data.error || "Import failed.";
-    } else {
-      const r = data.import_result;
-      statusEl.textContent = `Imported ${r.scanned} of ${r.total_ids} (${r.new_bank_rfi} tagged "bank rfi", ${r.failed} failed).`;
-      const rows = (r.details || []).map(d => {
-        if (!d.found) return `<div style="margin:4px 0;"><span class="pill">${d.txn_id}</span> <span style="color:var(--status-critical);">not found -- checked both Sumsub's internal ID and your system's external ID, verify it's correct and credentials have access to it</span></div>`;
-        const tagList = d.tags.length ? d.tags.map(t => `<span class="pill">${t}</span>`).join(" ") : '<em style="color:var(--text-muted);">no tags on this transaction</em>';
-        const verdict = d.is_bank_rfi
-          ? '<span style="color:var(--status-good); font-weight:600;">matched "bank rfi"</span>'
-          : '<span style="color:var(--text-muted);">no "bank rfi" tag found</span>';
-        return `<div style="margin:4px 0;"><span class="pill">${d.txn_id}</span> ${verdict} &mdash; tags: ${tagList}</div>`;
-      }).join("");
-      detailsEl.innerHTML = rows ? `<div class="desc" style="margin-bottom:6px;">What Sumsub actually returned for each ID:</div>${rows}` : "";
-      document.getElementById("importIdsText").value = "";
-      await loadAll();
+      btn.disabled = false;
+      btn.textContent = "Import these transactions";
+      return;
     }
+    statusEl.textContent = `Starting import of ${data.total_ids} transaction(s)…`;
+    document.getElementById("importIdsText").value = "";
+    await pollImportStatus(btn, statusEl);
   } catch (err) {
     statusEl.textContent = "Import failed: " + err;
-  } finally {
     btn.disabled = false;
     btn.textContent = "Import these transactions";
   }
