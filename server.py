@@ -116,6 +116,19 @@ INGEST_INTERVAL_MINUTES = int(os.environ.get("INGEST_INTERVAL_MINUTES", "60"))  
 CONNECTION_CHECK_CACHE_SECONDS = 60
 
 
+def _normalize_tag(text: str) -> str:
+    """Case-insensitive, whitespace-collapsed tag comparison key -- so a tag
+    stored on Sumsub as "Bank RFI", " bank  rfi ", or "BANK RFI" all still
+    match BANK_RFI_TAG. This is the ONLY thing that decides whether a fetched
+    transaction counts as "bank rfi" -- every transaction the bot pulls in
+    (via webhook or the manual ID import) is checked against this, and it's
+    an exact match on the tag's label text, not a fuzzy/partial one."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+BANK_RFI_TAG_NORMALIZED = _normalize_tag(BANK_RFI_TAG)
+
+
 # ============================================================================
 # Sumsub API client -- HMAC-SHA256 request signing per
 # https://docs.sumsub.com/reference/authentication
@@ -784,7 +797,7 @@ def _dig(d: dict, *paths: str):
 
 def normalize_txn(raw: dict, tags: list[str], notes: list[dict] | None = None) -> dict:
     txn_id = _dig(raw, "id", "txnId", "kytTxnId") or raw.get("id")
-    is_rfi = any((t or "").strip().lower() == BANK_RFI_TAG.strip().lower() for t in tags)
+    is_rfi = any(_normalize_tag(t) == BANK_RFI_TAG_NORMALIZED for t in tags)
     note_texts = [n.get("note") for n in (notes or []) if isinstance(n, dict) and n.get("note")]
     return {
         "txn_id": txn_id,
@@ -842,6 +855,9 @@ def import_txn_ids(client: SumsubClient, txn_ids: list[str]) -> dict:
     real transactions to go fetch since Sumsub won't let it discover them
     on its own."""
     scanned = new_rfi = failed = 0
+    details = []  # per-ID diagnostics -- exactly which tags Sumsub returned for
+    # each one, so a mismatch (wrong tag spelling, wrong ID, transaction not
+    # found) is visible immediately instead of a silent "0 imported".
     for txn_id in txn_ids:
         txn_id = (txn_id or "").strip()
         if not txn_id:
@@ -850,10 +866,13 @@ def import_txn_ids(client: SumsubClient, txn_ids: list[str]) -> dict:
         if row:
             scanned += 1
             new_rfi += 1 if row["is_bank_rfi"] else 0
+            details.append({"txn_id": txn_id, "found": True, "tags": row.get("tags", []),
+                             "is_bank_rfi": bool(row["is_bank_rfi"])})
         else:
             failed += 1
+            details.append({"txn_id": txn_id, "found": False, "tags": [], "is_bank_rfi": False})
     return {"strategy": "manual_id_import", "ran": scanned > 0, "scanned": scanned,
-            "new_bank_rfi": new_rfi, "failed": failed, "total_ids": len(txn_ids)}
+            "new_bank_rfi": new_rfi, "failed": failed, "total_ids": len(txn_ids), "details": details}
 
 
 def backfill_from_travelrule_query(client: SumsubClient, limit: int = 100, max_pages: int = 20) -> dict:
@@ -1338,6 +1357,7 @@ FRONTEND_HTML = r"""<!doctype html>
           <button class="refresh" id="importBtn">Import these transactions</button>
           <span id="importStatus"></span>
         </div>
+        <div id="importDetails" style="margin-top:12px;"></div>
       </div>
     </details>
 
@@ -1564,10 +1584,12 @@ document.getElementById("refreshBtn").addEventListener("click", async (e) => {
 document.getElementById("importBtn").addEventListener("click", async (e) => {
   const btn = e.target;
   const statusEl = document.getElementById("importStatus");
+  const detailsEl = document.getElementById("importDetails");
   const text = document.getElementById("importIdsText").value;
   btn.disabled = true;
   btn.textContent = "Importing…";
   statusEl.textContent = "";
+  detailsEl.innerHTML = "";
   try {
     const resp = await fetch("/api/ingest/import-ids", {
       method: "POST",
@@ -1580,6 +1602,15 @@ document.getElementById("importBtn").addEventListener("click", async (e) => {
     } else {
       const r = data.import_result;
       statusEl.textContent = `Imported ${r.scanned} of ${r.total_ids} (${r.new_bank_rfi} tagged "bank rfi", ${r.failed} failed).`;
+      const rows = (r.details || []).map(d => {
+        if (!d.found) return `<div style="margin:4px 0;"><span class="pill">${d.txn_id}</span> <span style="color:var(--status-critical);">not found -- check the ID is correct and credentials have access to it</span></div>`;
+        const tagList = d.tags.length ? d.tags.map(t => `<span class="pill">${t}</span>`).join(" ") : '<em style="color:var(--text-muted);">no tags on this transaction</em>';
+        const verdict = d.is_bank_rfi
+          ? '<span style="color:var(--status-good); font-weight:600;">matched "bank rfi"</span>'
+          : '<span style="color:var(--text-muted);">no "bank rfi" tag found</span>';
+        return `<div style="margin:4px 0;"><span class="pill">${d.txn_id}</span> ${verdict} &mdash; tags: ${tagList}</div>`;
+      }).join("");
+      detailsEl.innerHTML = rows ? `<div class="desc" style="margin-bottom:6px;">What Sumsub actually returned for each ID:</div>${rows}` : "";
       document.getElementById("importIdsText").value = "";
       await loadAll();
     }
