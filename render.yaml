@@ -1,0 +1,39 @@
+# Render Blueprint -- only needed if your Render account offers "New +" ->
+# "Blueprint". If not (a manually-created Web Service works exactly the
+# same), just make sure the service's Build/Start commands and env vars
+# match what's below -- that's all Render needs, nothing else to configure.
+#
+# The two `sync: false` entries are exactly where your Sumsub credentials
+# go: Render will NOT read them from this file (so they never touch GitHub)
+# -- paste the real values into the service's "Environment" tab instead.
+services:
+  - type: web
+    name: bank-rfi-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: SUMSUB_APP_TOKEN
+        sync: false          # <-- your rotated app token goes here, in the Render dashboard only
+      - key: SUMSUB_SECRET_KEY
+        sync: false          # <-- your rotated secret key goes here, in the Render dashboard only
+      - key: INGEST_INTERVAL_MINUTES
+        value: "60"
+
+# Works as-is on Render's Free plan with zero further changes -- the only
+# tradeoff is that the SQLite database (and therefore everything the bot has
+# learned) resets whenever the service restarts or redeploys, since Free has
+# no persistent disk. If/when a paid plan + payment method is available on
+# this account, add persistence with:
+#
+#     envVars:
+#       - key: BOT_DB_PATH
+#         value: /data/bank_rfi_bot.db
+#     disk:
+#       name: bank-rfi-bot-data
+#       mountPath: /data
+#       sizeGB: 1
+#
+# and change `plan: starter` (or higher) above so the disk is allowed.

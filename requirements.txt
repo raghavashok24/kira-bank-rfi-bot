@@ -1,0 +1,9 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+requests>=2.31
+scikit-learn>=1.4
+scipy>=1.11
+numpy>=1.26
+apscheduler>=3.10
+python-dotenv>=1.0
+python-multipart>=0.0.9
