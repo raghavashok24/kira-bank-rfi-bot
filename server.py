@@ -514,14 +514,43 @@ def _parse_amount(row: dict) -> float:
 
 
 def _parse_dt(row: dict):
+    """Parses txn_created_at into a naive UTC datetime (naive to stay
+    comparable with the rest of this file's timestamps, e.g. ingested_at
+    and datetime.min). This previously only tried Z-suffixed or
+    offset-less formats and truncated the input to a fixed length based on
+    the FORMAT string's length (not the actual date's length) before
+    matching -- neither of those lined up with Sumsub's real date format,
+    confirmed from actual API/webhook payloads elsewhere in this file, e.g.
+    "2025-11-17 17:26:49+0000" (space-separated, +0000 offset, no 'Z', no
+    'T'). Every real transaction was silently failing to parse and falling
+    back to ingested_at, which -- since the historical backfill walks
+    backward from now, inserting the newest real transactions FIRST and
+    the oldest LAST -- scrambles chronological order badly enough to make
+    "candidates since the last bank-rfi tag" come out empty even when
+    there plainly should be some."""
     ts = row.get("txn_created_at")
-    if not ts:
+    if ts is None or ts == "":
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+    ts = str(ts).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S.%f%z", "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",  # naive datetime.isoformat(), e.g. dev seed data
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
-            return datetime.strptime(ts[: len(fmt) + 5], fmt)
+            dt = datetime.strptime(ts, fmt)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
         except ValueError:
             continue
+    # Last resort: createdAtMs-style epoch milliseconds (or seconds) stored
+    # as a numeric string in the same text column.
+    try:
+        num = float(ts)
+        return datetime.utcfromtimestamp(num / 1000.0 if num > 1e12 else num)
+    except (TypeError, ValueError):
+        pass
     return None
 
 
@@ -973,37 +1002,70 @@ def _fmt_txn_date(dt: datetime) -> str:
 
 
 def _query_txn_window(client: SumsubClient, window_start: datetime, window_end: datetime, limit: int,
-                       seen_ids: set) -> tuple[int, int, bool]:
+                       seen_ids: set, max_pages: int = 500) -> dict:
     """Pages through ONE date window via offset (not the type filter --
-    see backfill_from_txn_query's docstring for why). Returns
-    (scanned, new_bank_rfi, had_any_items)."""
-    scanned = new_rfi = offset = 0
+    see backfill_from_txn_query's docstring for why). Returns a dict with
+    scanned/new_bank_rfi/had_items/errored/error_detail/pages -- crucially,
+    `had_items` and `errored` are kept SEPARATE: a failed/rate-limited
+    request must never be counted the same as "this month genuinely had no
+    transactions", or a temporary API hiccup gets misread as "we've reached
+    the start of history" and the whole crawl stops early. That distinction
+    is exactly what was missing before and is the most likely reason a
+    prior run returned far fewer transactions (88) than actually exist.
+
+    Two more differences from the earlier version, both modeled on the
+    proven-working reference implementation: a short sleep between page
+    requests (that code does the same, presumably to avoid tripping
+    Sumsub's rate limiting over a long multi-page crawl -- this code had no
+    throttling at all before, which is a very plausible way to get
+    silently rate-limited partway through a large backfill), and a
+    stalled-pagination guard: if a full page comes back but every item on
+    it was already seen, offset isn't advancing results (undocumented
+    behavior, possibly ignored by Sumsub, possibly account-specific) and
+    continuing would loop forever without finding anything new."""
+    scanned = new_rfi = offset = pages = 0
     had_items = False
-    while True:
+    errored = False
+    error_detail = None
+    while pages < max_pages:
         filters = {
             "data.txnDate__gte": _fmt_txn_date(window_start),
             "data.txnDate__lte": _fmt_txn_date(window_end),
         }
         resp = client.query_txns(filters=filters, limit=limit, order="-data.txnDate", offset=offset)
+        pages += 1
         if not resp.ok:
+            errored = True
+            error_detail = f"HTTP {resp.status}: {resp.raw_body[:300]}"
+            logger.warning("Txn query failed for window %s..%s at offset %d -- %s",
+                            window_start, window_end, offset, error_detail)
             break
         items = (resp.json_body or {}).get("items") or (resp.json_body or {}).get("list", {}).get("items") or []
         if not items:
             break
         had_items = True
+        new_this_page = 0
         for item in items:
             txn_id = _dig(item, "id", "txnId", "kytTxnId")
             if not txn_id or txn_id in seen_ids:
                 continue
             seen_ids.add(txn_id)
+            new_this_page += 1
             row = ingest_single_txn(client, txn_id)
             if row:
                 scanned += 1
                 new_rfi += 1 if row["is_bank_rfi"] else 0
         if len(items) < limit:
             break
+        if new_this_page == 0:
+            logger.warning("Txn query stalled (page full but no new items) for window %s..%s at offset %d "
+                            "-- offset pagination may not be advancing on Sumsub's side, stopping this window",
+                            window_start, window_end, offset)
+            break
         offset += limit
-    return scanned, new_rfi, had_items
+        time.sleep(0.3)  # matches the proven-working reference implementation's inter-page delay
+    return {"scanned": scanned, "new_bank_rfi": new_rfi, "had_items": had_items,
+            "errored": errored, "error_detail": error_detail, "pages": pages}
 
 
 def backfill_from_txn_query(client: SumsubClient, days_back: int = 2, limit: int = 100) -> dict:
@@ -1025,65 +1087,88 @@ def backfill_from_txn_query(client: SumsubClient, days_back: int = 2, limit: int
     one-time/on-demand full-history version."""
     now = datetime.now(timezone.utc)
     seen_ids = set()
-    scanned, new_rfi, had_items = _query_txn_window(client, now - timedelta(days=days_back), now, limit, seen_ids)
-    return {"strategy": "txn_query_recent", "ran": had_items, "scanned": scanned,
-            "new_bank_rfi": new_rfi, "days_back": days_back}
+    w = _query_txn_window(client, now - timedelta(days=days_back), now, limit, seen_ids)
+    return {"strategy": "txn_query_recent", "ran": w["had_items"], "scanned": w["scanned"],
+            "new_bank_rfi": w["new_bank_rfi"], "days_back": days_back,
+            "errored": w["errored"], "error_detail": w["error_detail"], "pages": w["pages"]}
 
 
 _backfill_history_job = {"running": False, "months_done": 0, "months_total": 0, "result": None,
                           "started_at": None, "finished_at": None}
 
 
-def run_deep_historical_backfill(client: SumsubClient, months_back: int = 60, max_empty_months: int = 6,
+def run_deep_historical_backfill(client: SumsubClient, months_back: int = 84, max_empty_months: int = 18,
                                   on_progress=None) -> dict:
     """One-time (or occasional, on-demand) DEEP crawl for full history --
     not part of the hourly cycle, since walking years of data every hour
     would be slow and would hammer Sumsub's API for no reason. Same proven
     date-range-only + offset-pagination approach as backfill_from_txn_query,
     just walked backward one calendar month at a time so each individual
-    query window stays modest, for up to `months_back` months (default 5
-    years), stopping early after `max_empty_months` consecutive empty
-    months (a proxy for "before this account had any transactions").
+    query window stays modest, for up to `months_back` months (default 7
+    years), stopping early after `max_empty_months` consecutive GENUINELY
+    empty months (a proxy for "before this account had any transactions").
+
+    That distinction matters: a month that ERRORED (rate-limited, timed
+    out, etc.) is NOT the same as a month that Sumsub confirmed has zero
+    transactions, and must not count toward the empty-streak stop --
+    conflating the two was a real bug in an earlier version of this
+    function, and rate-limiting is a real risk here specifically because
+    this crawl can issue hundreds of requests across years of monthly
+    windows. A rate-limited month is retried once (after a longer pause)
+    before being logged as errored and skipped, and the empty-streak
+    default was widened from 6 to 18 months since ordinary month-to-month
+    volume swings (slow periods, not "before the account existed") could
+    otherwise trigger a false early stop.
+
     Trigger via POST /api/ingest/backfill-history; poll
     GET /api/ingest/backfill-history-status for progress since this can
-    take a while for a large account."""
+    take a while for a large account. Returns a per-month `months` list so
+    exactly where any gap is (errored vs. genuinely empty) is visible
+    afterward instead of just one aggregate number."""
     scanned = new_rfi = empty_streak = months_walked = errored_months = 0
     seen_ids = set()
+    months_detail = []
     now = datetime.now(timezone.utc)
     year, month = now.year, now.month
     for i in range(months_back):
         window_start = datetime(year, month, 1, tzinfo=timezone.utc)
         window_end = (datetime(year + (1 if month == 12 else 0), (1 if month == 12 else month + 1), 1,
                                 tzinfo=timezone.utc) - timedelta(seconds=1))
+        label = f"{year:04d}-{month:02d}"
         try:
-            m_scanned, m_new_rfi, had_items = _query_txn_window(client, window_start, window_end, 100, seen_ids)
-        except Exception:
-            # A transient network blip on ONE month must not abort the whole
-            # multi-year crawl -- log it, count the month as "not empty" (so
-            # it doesn't falsely count toward the empty-streak stop
-            # condition), and keep walking backward through the rest.
-            logger.exception("Deep backfill: month %04d-%02d failed, skipping", year, month)
-            errored_months += 1
-            months_walked += 1
-            if on_progress:
-                on_progress(i + 1, months_back)
-            month -= 1
-            if month == 0:
-                month, year = 12, year - 1
-            continue
-        scanned += m_scanned
-        new_rfi += m_new_rfi
+            w = _query_txn_window(client, window_start, window_end, 100, seen_ids)
+            if w["errored"]:
+                # One retry after a longer backoff -- covers a transient
+                # rate-limit/hiccup without abandoning the whole crawl or
+                # burning through retries too fast.
+                logger.warning("Deep backfill: month %s errored (%s), retrying once after backoff",
+                                label, w["error_detail"])
+                time.sleep(3)
+                w = _query_txn_window(client, window_start, window_end, 100, seen_ids)
+        except Exception as e:  # noqa: BLE001 - one bad month must not abort the whole crawl
+            logger.exception("Deep backfill: month %s raised an exception, skipping", label)
+            w = {"scanned": 0, "new_bank_rfi": 0, "had_items": False, "errored": True, "error_detail": str(e)}
         months_walked += 1
-        empty_streak = 0 if had_items else empty_streak + 1
+        scanned += w["scanned"]
+        new_rfi += w["new_bank_rfi"]
+        months_detail.append({"month": label, "scanned": w["scanned"], "errored": w["errored"],
+                               "error_detail": w.get("error_detail")})
         if on_progress:
             on_progress(i + 1, months_back)
-        if empty_streak >= max_empty_months:
-            break
+        if w["errored"]:
+            errored_months += 1
+            # Do NOT touch empty_streak -- an error is not evidence this
+            # month had no transactions, so it must not count as "empty".
+        else:
+            empty_streak = 0 if w["had_items"] else empty_streak + 1
+            if empty_streak >= max_empty_months:
+                break
         month -= 1
         if month == 0:
             month, year = 12, year - 1
     return {"strategy": "deep_historical_backfill", "ran": scanned > 0, "scanned": scanned,
-            "new_bank_rfi": new_rfi, "months_walked": months_walked, "errored_months": errored_months}
+            "new_bank_rfi": new_rfi, "months_walked": months_walked, "errored_months": errored_months,
+            "months": months_detail}
 
 
 def backfill_from_applicant_walk(client: SumsubClient, max_applicants: int = 200) -> dict:
@@ -1986,7 +2071,10 @@ async function pollBackfillHistoryStatus(btn, statusEl) {
       statusEl.textContent = "Backfill failed: " + s.result.error;
     } else if (s.result) {
       const r = s.result;
-      statusEl.textContent = `Done -- walked ${r.months_walked} month(s), found ${r.scanned} transaction(s) (${r.new_bank_rfi} tagged "bank rfi").`;
+      const errNote = r.errored_months > 0
+        ? ` (${r.errored_months} month(s) errored even after a retry -- see server logs for details; run it again to fill those in)`
+        : "";
+      statusEl.textContent = `Done -- walked ${r.months_walked} month(s), found ${r.scanned} transaction(s) (${r.new_bank_rfi} tagged "bank rfi")${errNote}.`;
     }
     await loadAll();
     break;
