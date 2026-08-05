@@ -90,6 +90,7 @@ import re
 import sqlite3
 import statistics
 import time
+import urllib.parse
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -244,10 +245,21 @@ class SumsubClient:
         all) with plain ?offset=N paging and gets transactions of every
         type back. That's confirmed-in-production behavior, not a guess, so
         offset support is treated as real even though the public docs are
-        silent on it."""
+        silent on it.
+
+        Filter VALUES are percent-encoded (Python's urllib.quote, safe="")
+        to match that proven request byte-for-byte -- the working reference
+        implementation runs each value through JS's encodeURIComponent
+        before inserting it into the path, which escapes ':', '+', and
+        spaces (e.g. a date filter becomes '2026-08-01%2000%3A00%3A00%2B0000').
+        An earlier version of this method inserted filter values into the
+        path RAW/unencoded, which is a different request on the wire -- and
+        was confirmed (by a real account returning far fewer transactions
+        than expected) to make Sumsub parse the date range differently, not
+        just to be a cosmetic difference."""
         path_filters = ""
         if filters:
-            path_filters = ";" + ";".join(f"{k}={v}" for k, v in filters.items())
+            path_filters = ";" + ";".join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in filters.items())
         return self.get(f"/resources/kyt/txns/query/-{path_filters}?limit={limit}&order={order}&offset={offset}",
                          raise_on_error=False)
 
