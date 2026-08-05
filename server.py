@@ -497,6 +497,14 @@ def webhook_event_count() -> int:
 HIGH_RISK_COUNTRIES = {"IR", "KP", "SY", "AF", "MM", "VE", "RU", "BY"}
 STRUCTURING_THRESHOLDS = [3000, 10000]
 CATEGORICAL_FEATURES = ["currency", "txn_type", "counterparty_country"]
+# Caps how many one-hot columns a single categorical feature can contribute.
+# A real account's counterparty_country/currency can have dozens of distinct
+# values -- left uncapped, that pushes total feature count well past what a
+# few dozen bank-rfi examples can support, which is a classic setup for a
+# classifier to memorize each positive's exact category combination instead
+# of learning anything general (everything that doesn't match one exactly
+# then scores near zero). See train_model's docstring for the full story.
+MAX_CATEGORICAL_VOCAB = 12
 NUMERIC_FEATURES = [
     "amount", "log_amount", "direction_out", "counterparty_high_risk", "is_round_amount",
     "near_reporting_threshold", "applicant_prior_txn_count", "applicant_prior_bank_rfi_count",
@@ -681,7 +689,17 @@ def analyze_patterns(bank_rfi_features: list[dict], other_features: list[dict]) 
 # ============================================================================
 
 def _vocab_for(features_list: list[dict], key: str) -> list[str]:
-    return sorted({str(f.get(key, "unknown")) for f in features_list})
+    """Builds the one-hot vocabulary for a categorical feature, capped to
+    the MAX_CATEGORICAL_VOCAB most frequent values (ties broken
+    alphabetically for determinism). Values outside the cap simply don't
+    match any of these columns at vectorization time -- i.e. they're
+    implicitly treated as "none of the common categories" rather than
+    getting their own dedicated (and, for a rare value, nearly useless)
+    dimension. This bounds total feature count regardless of how many
+    distinct real-world values (countries, currencies) an account has."""
+    counts = Counter(str(f.get(key, "unknown")) for f in features_list)
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [v for v, _ in ranked[:MAX_CATEGORICAL_VOCAB]]
 
 
 def _vectorize(features_list: list[dict], vocab: dict, scaler: StandardScaler | None = None, fit_scaler: bool = False):
@@ -719,6 +737,20 @@ class ModelBundle:
 
 
 def train_model(transactions: list[dict]) -> ModelBundle:
+    """The dataset here is almost always small-n (a few dozen bank-rfi
+    positives) and high-dimensional after one-hot encoding categoricals --
+    a setup where a lightly-regularized logistic regression easily
+    memorizes each positive's exact feature combination (helped along by
+    class_weight="balanced", which amplifies the loss contribution of each
+    rare positive). Once sigmoid-calibrated, that overfit decision function
+    tends to produce a "cliff": very high scores for inputs that closely
+    match a training positive, and near-zero for everything else, even
+    other transactions that share real risk characteristics. Two things
+    fight this: MAX_CATEGORICAL_VOCAB bounds how many one-hot dimensions a
+    single categorical feature can add (see _vocab_for), and C is set low
+    (stronger L2 regularization) rather than sklearn's default/previous
+    C=2.0, which was permissive enough to let the model fit almost
+    anything, including noise."""
     history_index = build_applicant_history_index(transactions)
     feats = [extract_features(t, history_index) for t in transactions]
     for f, t in zip(feats, transactions):
@@ -745,12 +777,12 @@ def train_model(transactions: list[dict]) -> ModelBundle:
         X = _vectorize(feats, vocab, scaler, fit_scaler=True)
         y = np.array([1 if f["_is_bank_rfi"] else 0 for f in feats])
 
-        explain_clf = LogisticRegression(max_iter=3000, class_weight="balanced", C=2.0)
+        explain_clf = LogisticRegression(max_iter=3000, class_weight="balanced", C=0.3)
         explain_clf.fit(X, y)
 
         n_pos = int(y.sum())
         cv_folds = max(2, min(5, n_pos // 5))
-        base_clf = LogisticRegression(max_iter=3000, class_weight="balanced", C=2.0)
+        base_clf = LogisticRegression(max_iter=3000, class_weight="balanced", C=0.3)
         clf = CalibratedClassifierCV(base_clf, method="sigmoid", cv=cv_folds)
         clf.fit(X, y)
 
@@ -1923,7 +1955,7 @@ function drawPredTable() {
   empty.style.display = "none";
   body.innerHTML = rows.map((r, i) => `
     <tr class="clickable" data-idx="${i}">
-      <td><span class="risk-badge ${riskClass(r.risk_score, r._riskRank, rows.length)}">${(r.risk_score*100).toFixed(0)}%</span></td>
+      <td><span class="risk-badge ${riskClass(r.risk_score, r._riskRank, rows.length)}">${(r.risk_score*100).toFixed(1)}%</span></td>
       <td>${r.txn_id}</td>
       <td>${fmt(r.amount)} ${r.currency||""}</td>
       <td>${r.counterparty_country || "–"}</td>
