@@ -21,17 +21,22 @@ Deploy on Render:
 
 HOW DATA GETS IN (no separate/local data files -- everything comes from the
 Sumsub API):
-  1. Webhooks (the real mechanism for "keeps growing as tags change on
-     Sumsub"): register this app's /api/webhooks/sumsub URL in Sumsub
-     Dashboard -> Settings -> Webhooks for Transaction Monitoring events.
-     Every lifecycle event Sumsub fires includes the transaction's Sumsub ID
-     (kytTxnId, confirmed against Sumsub's real webhook payload docs) -- the
-     bot fetches that transaction's tags immediately and stores it if
-     they include "bank rfi".
-  2. An hourly background job (co-located in this same process) re-runs a
-     best-effort historical backfill, then retrains on everything in the
-     database -- see WHAT'S VERIFIED VS. ASSUMED below for exactly which
-     backfill strategies are confirmed-working vs. experimental.
+  1. Webhooks (the real, event-driven mechanism -- this is what keeps the
+     bot "constantly running" rather than waiting on a timer): register
+     this app's /api/webhooks/sumsub URL in Sumsub Dashboard -> Settings ->
+     Webhooks for Transaction Monitoring events. Every lifecycle event
+     Sumsub fires includes the transaction's Sumsub ID (kytTxnId, confirmed
+     against Sumsub's real webhook payload docs) -- the bot fetches that
+     transaction's tags immediately, stores it, and retrains on the spot
+     (see retrain_only()) so the model and predictions are current within
+     seconds of the event, not the next scheduled cycle.
+  2. A background safety-net job (co-located in this same process, default
+     hourly, see INGEST_INTERVAL_MINUTES) re-runs the best-effort historical
+     backfill and retrains -- this exists only to catch anything the webhook
+     missed (not registered yet, a dropped delivery, etc.), it is not the
+     primary way the model stays current -- see WHAT'S VERIFIED VS. ASSUMED
+     below for exactly which backfill strategies are confirmed-working vs.
+     experimental.
 
 WHAT'S VERIFIED VS. ASSUMED (read this before trusting a prediction) -- this
 section reflects live research against Sumsub's published API docs, not
@@ -112,7 +117,7 @@ SUMSUB_BASE_URL = os.environ.get("SUMSUB_BASE_URL", "https://api.sumsub.com")
 BANK_RFI_TAG = os.environ.get("BANK_RFI_TAG", "bank rfi")
 DB_PATH = os.environ.get("BOT_DB_PATH", os.path.join(HERE, "bank_rfi_bot.db"))
 MIN_ML_SAMPLES = int(os.environ.get("MIN_ML_SAMPLES", "15"))
-INGEST_INTERVAL_MINUTES = int(os.environ.get("INGEST_INTERVAL_MINUTES", "60"))  # hourly by default, per spec
+INGEST_INTERVAL_MINUTES = int(os.environ.get("INGEST_INTERVAL_MINUTES", "60"))  # safety-net backfill sweep only -- real retraining is event-driven via the webhook, see retrain_only()
 CONNECTION_CHECK_CACHE_SECONDS = 60
 
 
@@ -198,7 +203,20 @@ class SumsubClient:
         return self._request("GET", path_with_query, raise_on_error=raise_on_error)
 
     def get_transaction(self, txn_id: str) -> dict:
+        """Look up by SUMSUB'S OWN internal transaction ID (the one it
+        generates and returns in its API responses / webhook payloads --
+        confirmed field name `kytTxnId`)."""
         return self.get(f"/resources/kyt/txns/{txn_id}/one").json_body
+
+    def get_transaction_by_external_id(self, external_txn_id: str) -> dict:
+        """Look up by the CLIENT-supplied external transaction ID instead --
+        i.e. whatever ID your own system assigned when the transaction was
+        originally submitted to Sumsub (docs.sumsub.com/reference/get-
+        transaction-information-by-txnid: "unique transaction identifier in
+        YOUR system"). This is a different endpoint shape and a different ID
+        space from get_transaction() above -- e.g. a transfer_uuid pulled
+        from your own records is this kind of ID, not Sumsub's internal one."""
+        return self.get(f"/resources/kyt/txns/-;data.txnId={external_txn_id}/one").json_body
 
     def get_txn_tags(self, txn_id: str) -> list[str]:
         resp = self.get(f"/resources/kyt/txns/{txn_id}/tags")
@@ -822,38 +840,77 @@ def normalize_txn(raw: dict, tags: list[str], notes: list[dict] | None = None) -
 
 
 def ingest_single_txn(client: SumsubClient, txn_id: str) -> dict | None:
+    """Accepts EITHER kind of transaction ID and figures out which one it got:
+    Sumsub's own internal ID (what webhooks hand you) or the external ID your
+    own system assigned when the transaction was submitted (e.g. a
+    transfer_uuid pulled from your own records/spreadsheets) -- these are two
+    different ID spaces on Sumsub's side, looked up via two different
+    endpoints. Tries the internal-ID lookup first (cheaper, and what webhook-
+    driven ingestion always has), falls back to the external-ID lookup if
+    that 404s, so callers never need to know in advance which kind they have."""
+    raw = None
     try:
         raw = client.get_transaction(txn_id)
-        tags = client.get_txn_tags(txn_id)
-        notes = client.get_txn_notes(txn_id)
-    except SumsubAPIError as e:
-        logger.warning("Sumsub rejected the request for txn %s: %s", txn_id, e)
-        return None
-    except Exception as e:  # noqa: BLE001 -- network hiccups (timeouts, proxy/DNS
-        # issues) must not crash a bulk import or backfill loop over many IDs;
-        # skip this one transaction and let the caller keep going.
+    except SumsubAPIError:
+        raw = None  # not found by Sumsub's internal ID -- try the external ID next
+    except Exception as e:  # noqa: BLE001 -- network hiccup, not a "not found"
         logger.warning("Network error fetching txn %s: %s", txn_id, e)
         return None
+
+    if raw is None:
+        try:
+            raw = client.get_transaction_by_external_id(txn_id)
+        except SumsubAPIError as e:
+            logger.warning("Sumsub has no transaction matching %s (checked both its own "
+                            "internal ID and your system's external ID): %s", txn_id, e)
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Network error fetching txn %s: %s", txn_id, e)
+            return None
+
+    # Whichever lookup worked, get_txn_tags/get_txn_notes still need SUMSUB'S
+    # OWN internal ID (the "id" field in the response), not necessarily the
+    # ID we were originally given.
+    internal_id = _dig(raw, "id", "txnId", "kytTxnId") or txn_id
+    try:
+        tags = client.get_txn_tags(internal_id)
+    except SumsubAPIError as e:
+        logger.warning("Failed to fetch tags for txn %s: %s", internal_id, e)
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Network error fetching tags for txn %s: %s", internal_id, e)
+        return None
+    try:
+        notes = client.get_txn_notes(internal_id)
+    except Exception as e:  # noqa: BLE001 -- notes are supplementary evidence only,
+        # don't throw away an otherwise-successful fetch over a notes hiccup.
+        logger.warning("Failed to fetch notes for txn %s (continuing without them): %s", internal_id, e)
+        notes = []
+
     row = normalize_txn(raw, tags, notes)
     if not row.get("txn_id"):
-        row["txn_id"] = txn_id
+        row["txn_id"] = internal_id
     upsert_transaction(row)
     return row
 
 
 def import_txn_ids(client: SumsubClient, txn_ids: list[str]) -> dict:
-    """Bulk-import by Sumsub transaction ID -- the honest bridge for
-    historical "bank rfi" data. Sumsub's public API has no endpoint that
-    lists/searches transactions by tag (confirmed against their docs: the
-    only query endpoint is Travel-Rule/crypto-only, and there's no general
-    "list transactions" or "filter by tag" API). Their DASHBOARD does let you
+    """Bulk-import by transaction ID -- the honest bridge for historical
+    "bank rfi" data. Sumsub's public API has no endpoint that lists/searches
+    transactions by tag (confirmed against their docs: the only query
+    endpoint is Travel-Rule/crypto-only, and there's no general "list
+    transactions" or "filter by tag" API). Their DASHBOARD does let you
     filter/search transactions by tag, though, so the intended flow is:
     filter by "bank rfi" in the Sumsub Dashboard, copy the transaction IDs
-    shown there, and paste them in here. Every ID is then resolved through
-    a real Sumsub API call (get_transaction + get_txn_tags + get_txn_notes)
-    -- nothing here is synthetic or guessed, this just tells the bot which
-    real transactions to go fetch since Sumsub won't let it discover them
-    on its own."""
+    shown there, and paste them in here -- OR pull IDs from your own
+    records (a Slack thread, a spreadsheet of transfer IDs, whatever you've
+    got) since ingest_single_txn() accepts EITHER Sumsub's internal ID or
+    your own system's external ID for each transaction and figures out
+    which one it got. Every ID is then resolved through a real Sumsub API
+    call (get_transaction/get_transaction_by_external_id + get_txn_tags +
+    get_txn_notes) -- nothing here is synthetic or guessed, this just tells
+    the bot which real transactions to go fetch since Sumsub won't let it
+    discover them on its own."""
     scanned = new_rfi = failed = 0
     details = []  # per-ID diagnostics -- exactly which tags Sumsub returned for
     # each one, so a mismatch (wrong tag spelling, wrong ID, transaction not
@@ -1042,21 +1099,12 @@ def _feature_importances(bundle: ModelBundle) -> dict:
         return {}
 
 
-def run_ingest_and_retrain():
-    """The recurring job: pull/refresh data, then retrain on everything seen
-    so far. This is what makes the bot keep learning as each new bank-rfi
-    tag shows up."""
+def retrain_only():
+    """Just retrain on whatever is already in the database -- no Sumsub API
+    calls. This is the fast path used every time a webhook event comes in,
+    so the model is current within seconds of a real transaction/tag change
+    rather than waiting for the next scheduled cycle."""
     global _current_bundle
-    logger.info("Starting ingestion + retrain cycle")
-    client = get_client()
-    if client is None:
-        logger.warning("Credentials not set yet -- skipping ingestion, will retrain on whatever's already stored.")
-    else:
-        try:
-            result = run_full_backfill(client)
-            logger.info("Ingestion result: %s", {k: v for k, v in result.items() if k != "results"})
-        except Exception:
-            logger.exception("Ingestion failed; will still try to retrain on existing data")
     try:
         txns = all_transactions()
         if txns:
@@ -1071,6 +1119,27 @@ def run_ingest_and_retrain():
             logger.info("No transactions in the database yet -- nothing to train on.")
     except Exception:
         logger.exception("Retrain failed")
+
+
+def run_ingest_and_retrain():
+    """The SAFETY-NET job: attempts the best-effort historical backfill
+    strategies (see run_full_backfill), then retrains. This is not what
+    keeps the model current day-to-day anymore -- that's the webhook, which
+    triggers retrain_only() directly on every event, so the bot reacts the
+    moment a real transaction comes in instead of waiting on a timer. This
+    job exists only to periodically sweep for anything the webhook missed
+    (e.g. it wasn't registered yet, or a delivery was dropped)."""
+    logger.info("Starting safety-net ingestion + retrain cycle")
+    client = get_client()
+    if client is None:
+        logger.warning("Credentials not set yet -- skipping ingestion, will retrain on whatever's already stored.")
+    else:
+        try:
+            result = run_full_backfill(client)
+            logger.info("Ingestion result: %s", {k: v for k, v in result.items() if k != "results"})
+        except Exception:
+            logger.exception("Ingestion failed; will still try to retrain on existing data")
+    retrain_only()
 
 
 def _ensure_bundle_loaded():
@@ -1089,7 +1158,10 @@ def on_startup():
                        next_run_time=datetime.now(timezone.utc))
     scheduler.start()
     app.state.scheduler = scheduler
-    logger.info("Scheduler started: ingest+retrain every %d minute(s)", INGEST_INTERVAL_MINUTES)
+    logger.info(
+        "Safety-net backfill+retrain scheduled every %d minute(s) -- but the model actually "
+        "retrains immediately on every webhook event, not on this timer.", INGEST_INTERVAL_MINUTES,
+    )
 
 
 @app.get("/api/setup")
@@ -1206,7 +1278,7 @@ async def api_import_ids(request: Request):
     if not raw_ids:
         return JSONResponse({"error": "No transaction IDs provided."}, status_code=400)
     result = import_txn_ids(client, raw_ids)
-    run_ingest_and_retrain()  # retrain immediately so this shows up without waiting for the next hourly cycle
+    retrain_only()  # each ID was already fetched for real above; just retrain on the updated data now
     return {"import_result": result, "summary": api_summary()}
 
 
@@ -1225,9 +1297,16 @@ async def api_sumsub_webhook(request: Request):
         return {"received": True, "processed": False, "reason": "credentials not configured"}
     try:
         row = process_webhook_event(client, event)
-        if row and row.get("is_bank_rfi"):
-            logger.info("New bank-rfi transaction via webhook: %s -- retraining", row["txn_id"])
-            run_ingest_and_retrain()
+        if row:
+            # Retrain immediately on EVERY real transaction event -- tagged
+            # "bank rfi" or not -- so the model, the candidate pool, and the
+            # pattern stats are current within seconds of Sumsub sending
+            # this event. This is the bot's actual "constantly running"
+            # mechanism; the hourly job is only a safety net (see
+            # run_ingest_and_retrain's docstring).
+            tag_note = "new bank-rfi transaction" if row.get("is_bank_rfi") else "transaction update"
+            logger.info("Webhook event processed (%s): %s -- retraining now", tag_note, row["txn_id"])
+            retrain_only()
     except Exception:
         logger.exception("Failed to process webhook event: %s", event)
     return {"received": True}
@@ -1347,12 +1426,15 @@ FRONTEND_HTML = r"""<!doctype html>
           Sumsub's API has no endpoint to list or search transactions by tag &mdash;
           but the Sumsub <strong>Dashboard</strong> does let you filter transactions
           by tag. Filter for &ldquo;bank rfi&rdquo; there, copy the transaction IDs it
-          shows, and paste them below. Each one is then fetched for real from the
+          shows, and paste them below &mdash; or paste IDs straight from your own
+          records (a spreadsheet, a Slack thread) instead, since either Sumsub's own
+          transaction ID or your system's external/transfer ID works here, the bot
+          tries both automatically. Each one is then fetched for real from the
           Sumsub API (full details, tags, notes) &mdash; nothing here is guessed or
           made up, this just tells the bot which real transactions to go get, since
           Sumsub won't let it discover them on its own.
         </p>
-        <textarea id="importIdsText" rows="4" placeholder="One transaction ID per line, or comma-separated"></textarea>
+        <textarea id="importIdsText" rows="4" placeholder="One transaction ID per line, or comma-separated -- Sumsub's own ID or your system's external/transfer ID both work"></textarea>
         <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
           <button class="refresh" id="importBtn">Import these transactions</button>
           <span id="importStatus"></span>
@@ -1460,7 +1542,7 @@ function renderSetup(s) {
     icon: webhookRegistered ? "good" : "warn",
     text: (webhookRegistered
       ? `<strong>Webhook is live</strong> -- ${s.webhook_events_received.toLocaleString()} event(s) received so far. This is the mechanism that keeps ingesting new data straight from Sumsub with no separate data files.`
-      : `<strong>Register this webhook URL</strong> in Sumsub Dashboard &rarr; Settings &rarr; Webhooks (Transaction Monitoring events) so every new "${s.bank_rfi_tag}" tag is picked up automatically -- no manual data entry needed:`)
+      : `<strong>No webhook events received yet.</strong> This checks whether Sumsub has actually sent anything here -- it can't check Sumsub's own settings (Sumsub doesn't expose an API for that), so if you've <em>already</em> registered the URL below, this just means no matching event has fired yet, not that registration failed. If you just set it up, try clicking "Test webhook" in Sumsub's Webhook manager, or check Sumsub's own <strong>Webhook logs</strong> page to see delivery attempts and their status directly. If you haven't registered it yet, add this URL in Sumsub Dashboard &rarr; Webhook manager for Transaction Monitoring events:`)
       + `<br/><code class="copyline"><span>${s.webhook_url}</span><button onclick="copyToClipboard('${s.webhook_url}', this)">Copy</button></code>`
   });
   if (s.total_transactions === 0) {
@@ -1468,7 +1550,7 @@ function renderSetup(s) {
   } else if (s.total_bank_rfi === 0) {
     rows.push({icon: "warn", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested, but none tagged "${s.bank_rfi_tag}" yet.</strong> If you know some already carry that tag in Sumsub, use "Import known &lsquo;bank rfi&rsquo; transactions by ID" below -- filter by "${s.bank_rfi_tag}" in the Sumsub Dashboard, copy the IDs it shows, and paste them there. Sumsub's API has no way to list transactions by tag on its own, so this is the fastest way in.`});
   } else {
-    rows.push({icon: "good", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested</strong>, ${s.total_bank_rfi.toLocaleString()} tagged "${s.bank_rfi_tag}" so far -- retraining every ${s.ingest_interval_minutes} minute(s), all pulled from the Sumsub API.`});
+    rows.push({icon: "good", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested</strong>, ${s.total_bank_rfi.toLocaleString()} tagged "${s.bank_rfi_tag}" so far -- all pulled from the Sumsub API. The model retrains immediately every time a webhook event comes in (not on a timer); a safety-net sweep also runs every ${s.ingest_interval_minutes} minute(s) in case any webhook delivery was missed.`});
   }
   const allGood = s.connection_status === "ok" && s.total_transactions > 0;
   banner.style.display = "block";
@@ -1603,7 +1685,7 @@ document.getElementById("importBtn").addEventListener("click", async (e) => {
       const r = data.import_result;
       statusEl.textContent = `Imported ${r.scanned} of ${r.total_ids} (${r.new_bank_rfi} tagged "bank rfi", ${r.failed} failed).`;
       const rows = (r.details || []).map(d => {
-        if (!d.found) return `<div style="margin:4px 0;"><span class="pill">${d.txn_id}</span> <span style="color:var(--status-critical);">not found -- check the ID is correct and credentials have access to it</span></div>`;
+        if (!d.found) return `<div style="margin:4px 0;"><span class="pill">${d.txn_id}</span> <span style="color:var(--status-critical);">not found -- checked both Sumsub's internal ID and your system's external ID, verify it's correct and credentials have access to it</span></div>`;
         const tagList = d.tags.length ? d.tags.map(t => `<span class="pill">${t}</span>`).join(" ") : '<em style="color:var(--text-muted);">no tags on this transaction</em>';
         const verdict = d.is_bank_rfi
           ? '<span style="color:var(--status-good); font-weight:600;">matched "bank rfi"</span>'
