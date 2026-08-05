@@ -46,31 +46,37 @@ guesswork:
     signing scheme, and the webhook payload field names (kytTxnId is the
     correct ID to re-fetch; there is no "tags" field on the webhook payload
     itself, so a follow-up GET is required and is what this bot does).
-  - CONFIRMED BUT NARROW: /resources/kyt/txns/query/-  only returns results
-    when filtered to data.type=travelRule -- i.e. it is documented for
-    crypto Travel Rule transactions specifically, not general fiat KYT
-    transactions, and it has no tag filter or offset-based pagination (max
-    100 items per call, sorted by date). This bot still calls it every
-    cycle as a best-effort historical-backfill attempt with a date-cursor
-    pagination workaround, but if your transactions aren't Travel Rule type
-    it will legitimately return zero rows every time -- that's expected,
-    not a bug.
+  - CORRECTED (was wrong earlier): /resources/kyt/txns/query/- -- the public
+    docs only show examples filtered to data.type=travelRule and describe
+    that parameter as "Must be travelRule", which reads like the endpoint is
+    Travel-Rule/crypto-only. It isn't. A separate, already-working internal
+    Kira Financial tool queries this exact endpoint filtered ONLY by date
+    range (data.txnDate__gte/__lte, no data.type at all) with plain
+    ?offset=N pagination, against this same Sumsub account, and gets
+    transactions of every type back. That's confirmed-in-production
+    behavior, so this bot now queries the same way: date range + offset,
+    no type filter. See backfill_from_txn_query (hourly, last couple of
+    days -- the safety net) and run_deep_historical_backfill (triggered
+    on demand from the dashboard, walks the full account history month by
+    month). The old data.type=travelRule-only assumption baked into an
+    earlier version of this file was real docs-based research, but it was
+    still wrong -- treat this file's own past comments with the same
+    skepticism as any other doc.
   - UNCONFIRMED / EXPERIMENTAL: enumerating applicants and walking each
     one's transactions -- Sumsub's public docs do not document a "list this
     applicant's KYT transactions" endpoint, so this strategy tries a couple
     of plausible paths and silently no-ops if none exist on your account.
+    Now a secondary/supplementary strategy since the date-range query above
+    covers the general case.
   - UNCONFIRMED: which field (if any) names the bank that sent an RFI. The
     bot surfaces every plausible place this could live (a second tag, a
     compliance note, a best-effort counterparty-bank field) instead of
     picking one.
-  - BOTTOM LINE: for an account whose transactions are not Travel Rule/
-    crypto type, historical bulk backfill has no confirmed API path in
-    Sumsub's public docs today -- the reliable, fully-automatic mechanism
-    is the webhook, which is exactly what makes "grows as new bank-rfi tags
-    are added on Sumsub" work going forward. Open the running app's
-    dashboard -- it live-checks your credentials and tells you plainly
-    what's actually happening, rather than requiring you to trust this
-    comment.
+  - The webhook remains the real-time mechanism for "grows as new bank-rfi
+    tags are added on Sumsub" -- it fires on every transaction lifecycle
+    event regardless of type. Open the running app's dashboard -- it
+    live-checks your credentials and tells you plainly what's actually
+    happening, rather than requiring you to trust this comment.
 """
 from __future__ import annotations
 
@@ -87,7 +93,7 @@ import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import numpy as np
@@ -229,14 +235,21 @@ class SumsubClient:
             return []
         return resp.json_body.get("list", {}).get("items", [])
 
-    def query_txns(self, filters: dict | None = None, limit: int = 100, order: str = "-createdAt") -> SumsubResponse:
-        """Best-effort call to Sumsub's flexible txn search endpoint. Publicly
-        documented only for Travel Rule (crypto) transactions -- unconfirmed
-        whether it generalizes. Treated as diagnostic, never trusted blindly."""
+    def query_txns(self, filters: dict | None = None, limit: int = 100, order: str = "-createdAt",
+                    offset: int = 0) -> SumsubResponse:
+        """Sumsub's transaction-query endpoint. Its public docs only show
+        examples filtered to data.type=travelRule and don't document offset
+        pagination -- but a separate, already-working internal tool queries
+        this exact endpoint filtered ONLY by date range (no data.type at
+        all) with plain ?offset=N paging and gets transactions of every
+        type back. That's confirmed-in-production behavior, not a guess, so
+        offset support is treated as real even though the public docs are
+        silent on it."""
         path_filters = ""
         if filters:
             path_filters = ";" + ";".join(f"{k}={v}" for k, v in filters.items())
-        return self.get(f"/resources/kyt/txns/query/-{path_filters}?limit={limit}&order={order}", raise_on_error=False)
+        return self.get(f"/resources/kyt/txns/query/-{path_filters}?limit={limit}&order={order}&offset={offset}",
+                         raise_on_error=False)
 
     def list_applicants(self, offset: int = 0, limit: int = 50) -> SumsubResponse:
         return self.get(f"/resources/applicants/-;offset={offset};limit={limit}", raise_on_error=False)
@@ -895,28 +908,20 @@ def ingest_single_txn(client: SumsubClient, txn_id: str) -> dict | None:
 
 
 def import_txn_ids(client: SumsubClient, txn_ids: list[str], on_progress=None) -> dict:
-    """Bulk-import by transaction ID -- the honest bridge for historical
-    data Sumsub's API can't enumerate on its own. Confirmed against Sumsub's
-    docs (Get Started with API, the KYT developer guide, Find Specific TR
-    Transactions, Export Case Data, Transaction Monitoring Analytics): there
-    is NO endpoint that lists/searches/exports all KYT transactions --
-    the only documented query endpoint only returns Travel-Rule/crypto-type
-    transactions, and dashboard CSV export is a UI-only feature. This
-    applies to "give me every transaction" just as much as "give me every
-    bank-rfi transaction" -- neither is possible via a raw API call.
+    """Bulk-import by transaction ID -- a manual bridge for specific
+    transactions, kept alongside run_deep_historical_backfill (which now
+    covers "give me every transaction" automatically via a date-range
+    query, no data.type filter -- see that function's docstring for why
+    the earlier belief that Sumsub's query endpoint was Travel-Rule-only
+    turned out to be wrong). This box is for cases the automatic sweep
+    doesn't fit: a specific list filtered by tag in the Sumsub Dashboard,
+    or IDs pulled from your own records (a spreadsheet, a Slack thread).
 
-    So the same bridge covers both cases: filter/export transaction IDs
-    from the Sumsub DASHBOARD (filter by "bank rfi" tag for just those, or
-    export/list with no tag filter for literally everything you want
-    monitored) and paste them in here -- OR pull IDs from your own records
-    (a spreadsheet of transfer IDs, whatever you've got), since
     ingest_single_txn() accepts EITHER Sumsub's internal ID or your own
     system's external ID for each one and figures out which it got. Every
     ID is then resolved through a real Sumsub API call
     (get_transaction/get_transaction_by_external_id + get_txn_tags +
-    get_txn_notes) -- nothing here is synthetic or guessed, this just tells
-    the bot which real transactions to go fetch since Sumsub won't let it
-    discover them on its own.
+    get_txn_notes) -- nothing here is synthetic or guessed.
 
     `on_progress(done, total)` is called after every ID so a caller (the
     background job below) can report live status for large lists."""
@@ -946,52 +951,127 @@ def import_txn_ids(client: SumsubClient, txn_ids: list[str], on_progress=None) -
             "new_bank_rfi": new_rfi, "failed": failed, "total_ids": len(txn_ids), "details": details}
 
 
-def backfill_from_travelrule_query(client: SumsubClient, limit: int = 100, max_pages: int = 20) -> dict:
-    """Historical-backfill attempt via Sumsub's documented transaction-query
-    endpoint (docs.sumsub.com/reference/find-specific-tr-transactions). This
-    endpoint is confirmed to work ONLY when filtered to data.type=travelRule
-    (Travel Rule / crypto transactions) -- it has no tag filter and no
-    offset/cursor pagination, just `limit` (max 100) + `order`. To still walk
-    past the first 100 results, this uses a date-cursor trick: after each
-    page, re-query with data.txnDate__lte set just before the oldest item
-    seen so far. If your account's transactions aren't Travel Rule type,
-    Sumsub will legitimately return zero items every time -- that's expected
-    given what's actually documented, not a bug in this code."""
-    scanned = new_rfi = pages = 0
-    cursor = None
-    seen_ids = set()
-    while pages < max_pages:
-        filters = {"data.type": "travelRule"}
-        if cursor:
-            filters["data.txnDate__lte"] = cursor
-        resp = client.query_txns(filters=filters, limit=limit, order="-data.txnDate")
-        pages += 1
+def _fmt_txn_date(dt: datetime) -> str:
+    """The exact date-filter format Sumsub's transaction-query endpoint
+    expects, e.g. '2026-01-31 23:59:59+0000'. Confirmed working in
+    production (not just from docs) via a separate, already-functioning
+    internal tool that queries this same endpoint against this same Sumsub
+    account."""
+    return dt.strftime("%Y-%m-%d %H:%M:%S+0000")
+
+
+def _query_txn_window(client: SumsubClient, window_start: datetime, window_end: datetime, limit: int,
+                       seen_ids: set) -> tuple[int, int, bool]:
+    """Pages through ONE date window via offset (not the type filter --
+    see backfill_from_txn_query's docstring for why). Returns
+    (scanned, new_bank_rfi, had_any_items)."""
+    scanned = new_rfi = offset = 0
+    had_items = False
+    while True:
+        filters = {
+            "data.txnDate__gte": _fmt_txn_date(window_start),
+            "data.txnDate__lte": _fmt_txn_date(window_end),
+        }
+        resp = client.query_txns(filters=filters, limit=limit, order="-data.txnDate", offset=offset)
         if not resp.ok:
-            return {"strategy": "travelrule_query", "ran": pages > 1, "status": resp.status,
-                    "body": resp.raw_body[:500], "scanned": scanned, "new_bank_rfi": new_rfi, "pages": pages}
+            break
         items = (resp.json_body or {}).get("items") or (resp.json_body or {}).get("list", {}).get("items") or []
         if not items:
             break
-        oldest_date = None
-        new_this_page = 0
+        had_items = True
         for item in items:
             txn_id = _dig(item, "id", "txnId", "kytTxnId")
-            item_date = _dig(item, "data.txnDate", "createdAt")
-            if item_date and (oldest_date is None or item_date < oldest_date):
-                oldest_date = item_date
             if not txn_id or txn_id in seen_ids:
                 continue
             seen_ids.add(txn_id)
-            new_this_page += 1
             row = ingest_single_txn(client, txn_id)
             if row:
                 scanned += 1
                 new_rfi += 1 if row["is_bank_rfi"] else 0
-        if len(items) < limit or new_this_page == 0 or not oldest_date:
+        if len(items) < limit:
             break
-        cursor = oldest_date
-    return {"strategy": "travelrule_query", "ran": pages > 0 and scanned > 0, "scanned": scanned,
-            "new_bank_rfi": new_rfi, "pages": pages}
+        offset += limit
+    return scanned, new_rfi, had_items
+
+
+def backfill_from_txn_query(client: SumsubClient, days_back: int = 2, limit: int = 100) -> dict:
+    """The lightweight, EVERY-HOUR safety-net strategy: queries Sumsub's
+    transaction-query endpoint filtered ONLY by a recent date range
+    (data.txnDate__gte/__lte) -- deliberately NOT by data.type. Sumsub's
+    public docs for this endpoint only show examples with
+    data.type=travelRule and imply that's required, and don't mention
+    offset pagination at all -- but a separate, already-working internal
+    Kira Financial tool queries this exact endpoint the same way (date
+    range only, plain ?offset=N paging) against this same account and gets
+    transactions of every type back, not just Travel Rule. That's
+    confirmed-in-production behavior, so it's trusted here over the
+    ambiguous docs.
+
+    Scoped to the last `days_back` days (default 2, comfortably overlapping
+    the hourly cadence) rather than all-time, so the automatic safety net
+    stays fast and cheap -- see run_deep_historical_backfill for the
+    one-time/on-demand full-history version."""
+    now = datetime.now(timezone.utc)
+    seen_ids = set()
+    scanned, new_rfi, had_items = _query_txn_window(client, now - timedelta(days=days_back), now, limit, seen_ids)
+    return {"strategy": "txn_query_recent", "ran": had_items, "scanned": scanned,
+            "new_bank_rfi": new_rfi, "days_back": days_back}
+
+
+_backfill_history_job = {"running": False, "months_done": 0, "months_total": 0, "result": None,
+                          "started_at": None, "finished_at": None}
+
+
+def run_deep_historical_backfill(client: SumsubClient, months_back: int = 60, max_empty_months: int = 6,
+                                  on_progress=None) -> dict:
+    """One-time (or occasional, on-demand) DEEP crawl for full history --
+    not part of the hourly cycle, since walking years of data every hour
+    would be slow and would hammer Sumsub's API for no reason. Same proven
+    date-range-only + offset-pagination approach as backfill_from_txn_query,
+    just walked backward one calendar month at a time so each individual
+    query window stays modest, for up to `months_back` months (default 5
+    years), stopping early after `max_empty_months` consecutive empty
+    months (a proxy for "before this account had any transactions").
+    Trigger via POST /api/ingest/backfill-history; poll
+    GET /api/ingest/backfill-history-status for progress since this can
+    take a while for a large account."""
+    scanned = new_rfi = empty_streak = months_walked = errored_months = 0
+    seen_ids = set()
+    now = datetime.now(timezone.utc)
+    year, month = now.year, now.month
+    for i in range(months_back):
+        window_start = datetime(year, month, 1, tzinfo=timezone.utc)
+        window_end = (datetime(year + (1 if month == 12 else 0), (1 if month == 12 else month + 1), 1,
+                                tzinfo=timezone.utc) - timedelta(seconds=1))
+        try:
+            m_scanned, m_new_rfi, had_items = _query_txn_window(client, window_start, window_end, 100, seen_ids)
+        except Exception:
+            # A transient network blip on ONE month must not abort the whole
+            # multi-year crawl -- log it, count the month as "not empty" (so
+            # it doesn't falsely count toward the empty-streak stop
+            # condition), and keep walking backward through the rest.
+            logger.exception("Deep backfill: month %04d-%02d failed, skipping", year, month)
+            errored_months += 1
+            months_walked += 1
+            if on_progress:
+                on_progress(i + 1, months_back)
+            month -= 1
+            if month == 0:
+                month, year = 12, year - 1
+            continue
+        scanned += m_scanned
+        new_rfi += m_new_rfi
+        months_walked += 1
+        empty_streak = 0 if had_items else empty_streak + 1
+        if on_progress:
+            on_progress(i + 1, months_back)
+        if empty_streak >= max_empty_months:
+            break
+        month -= 1
+        if month == 0:
+            month, year = 12, year - 1
+    return {"strategy": "deep_historical_backfill", "ran": scanned > 0, "scanned": scanned,
+            "new_bank_rfi": new_rfi, "months_walked": months_walked, "errored_months": errored_months}
 
 
 def backfill_from_applicant_walk(client: SumsubClient, max_applicants: int = 200) -> dict:
@@ -1032,7 +1112,7 @@ def backfill_from_applicant_walk(client: SumsubClient, max_applicants: int = 200
 def run_full_backfill(client: SumsubClient) -> dict:
     started = datetime.now(timezone.utc).isoformat()
     results = []
-    for fn in (backfill_from_travelrule_query, backfill_from_applicant_walk):
+    for fn in (backfill_from_txn_query, backfill_from_applicant_walk):
         try:
             results.append(fn(client))
         except Exception as e:  # noqa: BLE001 - one bad strategy must not kill the run
@@ -1337,6 +1417,52 @@ def api_import_status():
     return {**_import_job, "summary": api_summary() if not _import_job["running"] else None}
 
 
+def _run_backfill_history_job_in_background(client: SumsubClient, months_back: int):
+    def on_progress(done, total):
+        _backfill_history_job["months_done"] = done
+        _backfill_history_job["months_total"] = total
+    try:
+        result = run_deep_historical_backfill(client, months_back=months_back, on_progress=on_progress)
+        retrain_only()
+        _backfill_history_job["result"] = result
+    except Exception as e:  # noqa: BLE001 - must not wedge the job state
+        logger.exception("Deep historical backfill job failed")
+        _backfill_history_job["result"] = {"error": str(e)}
+    finally:
+        _backfill_history_job["running"] = False
+        _backfill_history_job["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.post("/api/ingest/backfill-history")
+def api_backfill_history(background_tasks: BackgroundTasks, months_back: int = 60):
+    """Trigger a ONE-TIME deep historical crawl covering every transaction
+    type (see run_deep_historical_backfill) -- not part of the automatic
+    hourly cycle, which only checks a short recent window to stay fast.
+    Runs in the background; poll GET /api/ingest/backfill-history-status."""
+    client = get_client()
+    if client is None:
+        return JSONResponse(
+            {"error": "SUMSUB_APP_TOKEN / SUMSUB_SECRET_KEY aren't configured yet -- add them and redeploy first."},
+            status_code=400,
+        )
+    if _backfill_history_job["running"]:
+        return JSONResponse(
+            {"error": "A historical backfill is already running -- check /api/ingest/backfill-history-status."},
+            status_code=409,
+        )
+    _backfill_history_job.update(running=True, months_done=0, months_total=months_back, result=None,
+                                  started_at=datetime.now(timezone.utc).isoformat(), finished_at=None)
+    background_tasks.add_task(_run_backfill_history_job_in_background, client, months_back)
+    return {"status": "started", "months_back": months_back}
+
+
+@app.get("/api/ingest/backfill-history-status")
+def api_backfill_history_status():
+    """Poll this while a deep historical backfill (started via POST
+    .../backfill-history) is running."""
+    return {**_backfill_history_job, "summary": api_summary() if not _backfill_history_job["running"] else None}
+
+
 def _process_webhook_event_in_background(event: dict):
     """Runs AFTER the HTTP response has already been sent (see
     api_sumsub_webhook) -- this is what actually fetches the transaction and
@@ -1491,30 +1617,41 @@ FRONTEND_HTML = r"""<!doctype html>
   <div class="wrap">
     <section id="setupBanner" style="display:none;"></section>
 
-    <details class="section-collapse" id="importSection">
-      <summary>Import transactions by ID (works for &ldquo;bank rfi&rdquo; ones, or literally all of them)</summary>
+    <details class="section-collapse" id="deepBackfillSection">
+      <summary>Run a full historical backfill (every transaction type, not just recent ones)</summary>
       <div class="details-body">
         <p class="desc">
-          Sumsub's API has no endpoint to list, search, or export all KYT
-          transactions &mdash; confirmed against their docs, and this isn't limited
-          to tag filtering: the only documented transaction-query endpoint only
-          returns Travel-Rule/crypto-type transactions, so the automatic hourly
-          safety-net sweep can only ever find <em>that</em> subset on its own (if
-          you've seen a low "scanned" number like 7 in the ingestion history below,
-          that's the full count of Travel-Rule-type transactions on your account,
-          not a bug &mdash; the rest genuinely can't be enumerated via API).
+          The automatic hourly job only checks the last couple of days (fast, cheap,
+          catches anything the webhook missed recently). This button instead walks
+          your account's full history month by month, pulling <strong>every</strong>
+          transaction regardless of type &mdash; it queries Sumsub by date range only
+          (no type filter), which is what actually returns all transactions rather
+          than just Travel-Rule/crypto ones. It stops automatically once it hits
+          several consecutive empty months (i.e. before your account had any
+          transactions). This can take a while for a large account, so it runs in
+          the background with live progress below &mdash; safe to close this panel
+          and come back later.
         </p>
+        <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
+          <button class="refresh" id="backfillHistoryBtn">Run full historical backfill</button>
+          <span id="backfillHistoryStatus"></span>
+        </div>
+      </div>
+    </details>
+
+    <details class="section-collapse" id="importSection">
+      <summary>Import transactions by ID (bank-rfi-tagged ones, or any specific list)</summary>
+      <div class="details-body">
         <p class="desc">
-          The <strong>Dashboard</strong> is the way around that for both cases: filter
-          by &ldquo;bank rfi&rdquo; there for just those, or open the transactions list /
-          export with no tag filter to get IDs for <strong>every</strong> transaction you
-          want monitored, then paste the list below. You can also paste IDs straight
-          from your own records (a spreadsheet, a Slack thread) &mdash; either Sumsub's
-          own transaction ID or your system's external/transfer ID works, the bot
-          tries both automatically. Each one is then fetched for real from the Sumsub
-          API (full details, tags, notes) &mdash; nothing here is guessed or made up.
-          Large lists run as a background job so the page won't time out; progress
-          updates live below.
+          For most cases the full historical backfill above or the webhook already
+          covers it. This box is for pasting in specific transaction IDs directly
+          &mdash; from Sumsub's Dashboard (filter by &ldquo;bank rfi&rdquo; there, copy the
+          IDs it shows) or from your own records (a spreadsheet, a Slack thread).
+          Either Sumsub's own transaction ID or your system's external/transfer ID
+          works, the bot tries both automatically. Each one is then fetched for real
+          from the Sumsub API (full details, tags, notes) &mdash; nothing here is
+          guessed or made up. Large lists run as a background job so the page won't
+          time out; progress updates live below.
         </p>
         <textarea id="importIdsText" rows="4" placeholder="One transaction ID per line, or comma-separated -- Sumsub's own ID or your system's external/transfer ID both work"></textarea>
         <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
@@ -1628,7 +1765,7 @@ function renderSetup(s) {
       + `<br/><code class="copyline"><span>${s.webhook_url}</span><button onclick="copyToClipboard('${s.webhook_url}', this)">Copy</button></code>`
   });
   if (s.total_transactions === 0) {
-    rows.push({icon: "warn", text: `<strong>No data yet.</strong> All data comes straight from the Sumsub API -- either wait for transaction events to arrive via the webhook above, or use "Import transactions by ID" below (Sumsub's API can't list/export transactions at all, tagged or not, but its Dashboard can filter and show IDs -- that's the fastest way to backfill history, for "${s.bank_rfi_tag}"-tagged ones or every transaction you want monitored).`});
+    rows.push({icon: "warn", text: `<strong>No data yet.</strong> All data comes straight from the Sumsub API -- run "Run full historical backfill" below to pull your account's full transaction history, wait for new events to arrive via the webhook above, or use "Import transactions by ID" for a specific list.`});
   } else if (s.total_bank_rfi === 0) {
     rows.push({icon: "warn", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested, but none tagged "${s.bank_rfi_tag}" yet.</strong> If you know some already carry that tag in Sumsub, use "Import transactions by ID" below -- filter by "${s.bank_rfi_tag}" in the Sumsub Dashboard, copy the IDs it shows, and paste them there. Sumsub's API has no way to list transactions by tag (or at all) on its own, so this is the fastest way in.`});
   } else {
@@ -1786,6 +1923,89 @@ async function pollImportStatus(btn, statusEl) {
   btn.disabled = false;
   btn.textContent = "Import these transactions";
 }
+
+document.getElementById("importBtn").addEventListener("click", async (e) => {
+  const btn = e.target;
+  const statusEl = document.getElementById("importStatus");
+  const detailsEl = document.getElementById("importDetails");
+  const text = document.getElementById("importIdsText").value;
+  btn.disabled = true;
+  btn.textContent = "Importing…";
+  statusEl.textContent = "";
+  detailsEl.innerHTML = "";
+  try {
+    const resp = await fetch("/api/ingest/import-ids", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      statusEl.textContent = data.error || "Import failed.";
+      btn.disabled = false;
+      btn.textContent = "Import these transactions";
+      return;
+    }
+    statusEl.textContent = `Starting import of ${data.total_ids} transaction(s)…`;
+    document.getElementById("importIdsText").value = "";
+    await pollImportStatus(btn, statusEl);
+  } catch (err) {
+    statusEl.textContent = "Import failed: " + err;
+    btn.disabled = false;
+    btn.textContent = "Import these transactions";
+  }
+});
+
+async function pollBackfillHistoryStatus(btn, statusEl) {
+  while (true) {
+    await new Promise(r => setTimeout(r, 2000));
+    let s;
+    try {
+      s = await (await fetch("/api/ingest/backfill-history-status")).json();
+    } catch (err) {
+      statusEl.textContent = "Lost track of backfill progress: " + err;
+      break;
+    }
+    if (s.running) {
+      statusEl.textContent = `Walking history… month ${s.months_done} of up to ${s.months_total} checked so far. This can take a while -- feel free to leave this open.`;
+      continue;
+    }
+    if (s.result && s.result.error) {
+      statusEl.textContent = "Backfill failed: " + s.result.error;
+    } else if (s.result) {
+      const r = s.result;
+      statusEl.textContent = `Done -- walked ${r.months_walked} month(s), found ${r.scanned} transaction(s) (${r.new_bank_rfi} tagged "bank rfi").`;
+    }
+    await loadAll();
+    break;
+  }
+  btn.disabled = false;
+  btn.textContent = "Run full historical backfill";
+}
+
+document.getElementById("backfillHistoryBtn").addEventListener("click", async (e) => {
+  const btn = e.target;
+  const statusEl = document.getElementById("backfillHistoryStatus");
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  statusEl.textContent = "";
+  try {
+    const resp = await fetch("/api/ingest/backfill-history", {method: "POST"});
+    const data = await resp.json();
+    if (!resp.ok) {
+      statusEl.textContent = data.error || "Backfill failed to start.";
+      btn.disabled = false;
+      btn.textContent = "Run full historical backfill";
+      return;
+    }
+    statusEl.textContent = `Starting -- checking up to ${data.months_back} months of history…`;
+    await pollBackfillHistoryStatus(btn, statusEl);
+  } catch (err) {
+    statusEl.textContent = "Backfill failed: " + err;
+    btn.disabled = false;
+    btn.textContent = "Run full historical backfill";
+  }
+});
 
 document.getElementById("importBtn").addEventListener("click", async (e) => {
   const btn = e.target;
