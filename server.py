@@ -127,6 +127,46 @@ MIN_ML_SAMPLES = int(os.environ.get("MIN_ML_SAMPLES", "15"))
 INGEST_INTERVAL_MINUTES = int(os.environ.get("INGEST_INTERVAL_MINUTES", "60"))  # safety-net backfill sweep only -- real retraining is event-driven via the webhook, see retrain_only()
 CONNECTION_CHECK_CACHE_SECONDS = 60
 
+# Slack alerting -- optional, three ways to deliver, tried in this order:
+#   1. Slack Web API with a ROTATING (expiring) token pair -- used if
+#      SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_ACCESS_TOKEN, and
+#      SLACK_REFRESH_TOKEN are all set. This is what a Slack app with "Token
+#      Rotation" enabled issues: an access token (starts xoxe.xoxb-... for a
+#      bot, or xoxe.xoxp-... for a user) that expires in ~12 hours, paired
+#      with a refresh token (starts xoxe-1-...) used to mint a new pair
+#      before that happens. SLACK_CLIENT_ID/SLACK_CLIENT_SECRET come from
+#      the Slack app's Basic Information page ("App Credentials") -- both
+#      are required to call the refresh endpoint (oauth.v2.access).
+#      SLACK_ACCESS_TOKEN/SLACK_REFRESH_TOKEN are only the STARTING pair --
+#      see _get_valid_slack_access_token for how the bot keeps itself
+#      current after that (persisted in the slack_oauth_state table, since
+#      Slack invalidates each refresh token the moment it's used and issues
+#      a new one, so the original env var values stop working after the
+#      first automatic refresh).
+#   2. Slack Web API with a STATIC (non-expiring) bot token -- used if
+#      SLACK_BOT_TOKEN AND SLACK_CHANNEL are set (and option 1 isn't
+#      configured). This is the classic Bot User OAuth Token from OAuth &
+#      Permissions -> Bot Token Scopes (starts xoxb-...) -- no refresh
+#      logic needed, simpler if your app doesn't have Token Rotation on.
+#   3. Incoming Webhook -- used if SLACK_WEBHOOK_URL is set (and neither
+#      API option above is configured). Simplest: one URL, tied to one
+#      pre-chosen channel, no app/bot/scopes/tokens to manage at all.
+# If NONE of the above is configured, alerting is a silent no-op everywhere
+# it's called (see send_slack_alert). When one is configured, every open
+# transaction whose predicted risk score crosses SLACK_ALERT_THRESHOLD gets
+# posted exactly once (tracked via the transactions.slack_alerted flag),
+# right after every retrain -- both the webhook-triggered one and the
+# hourly safety-net one.
+SLACK_CLIENT_ID = os.environ.get("SLACK_CLIENT_ID", "")
+SLACK_CLIENT_SECRET = os.environ.get("SLACK_CLIENT_SECRET", "")
+SLACK_ACCESS_TOKEN = os.environ.get("SLACK_ACCESS_TOKEN", "")   # starting rotating access token (xoxe.xoxb-... / xoxe.xoxp-...)
+SLACK_REFRESH_TOKEN = os.environ.get("SLACK_REFRESH_TOKEN", "")  # starting refresh token (xoxe-1-...)
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")          # classic, non-expiring bot token (xoxb-...), alternative to the rotating pair above
+SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")              # e.g. "#potential-bank-rfi-alerts" or a channel ID like "C0123456789"
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+SLACK_ALERT_THRESHOLD = float(os.environ.get("SLACK_ALERT_THRESHOLD", "0.7"))
+SLACK_TOKEN_REFRESH_BUFFER_SECONDS = 300  # refresh this many seconds before actual expiry, not right at the deadline
+
 
 def _normalize_tag(text: str) -> str:
     """Case-insensitive, whitespace-collapsed tag comparison key -- so a tag
@@ -291,6 +331,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     notes TEXT,
     notes_text TEXT,
     is_bank_rfi INTEGER DEFAULT 0,
+    slack_alerted INTEGER DEFAULT 0,
     raw_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_txn_applicant ON transactions(applicant_id);
@@ -313,6 +354,19 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     received_at TEXT DEFAULT CURRENT_TIMESTAMP, event_type TEXT, kyt_txn_id TEXT,
     raw_json TEXT, processed INTEGER DEFAULT 0
 );
+
+-- Single-row table (id is always 1) holding the CURRENT Slack rotating
+-- access/refresh token pair, once the bot has refreshed at least once.
+-- Needed because Slack invalidates a refresh token the instant it's used
+-- and issues a brand-new one -- the SLACK_REFRESH_TOKEN env var is only the
+-- STARTING value; after the first automatic refresh, the live token pair
+-- lives here instead (see _get_valid_slack_access_token).
+CREATE TABLE IF NOT EXISTS slack_oauth_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    access_token TEXT,
+    refresh_token TEXT,
+    expires_at TEXT
+);
 """
 
 OPEN_STATUSES = ("init", "onHold", "awaitingUser", "pending", "queued", None, "")
@@ -325,6 +379,8 @@ def init_db():
         for new_col in ("notes", "notes_text", "counterparty_bank_name"):
             if new_col not in cols:
                 conn.execute(f"ALTER TABLE transactions ADD COLUMN {new_col} TEXT")
+        if "slack_alerted" not in cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN slack_alerted INTEGER DEFAULT 0")
 
 
 @contextmanager
@@ -362,6 +418,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     d["notes"] = json.loads(d.get("notes") or "[]")
     d["raw_json"] = json.loads(d.get("raw_json") or "{}")
     d["is_bank_rfi"] = bool(d.get("is_bank_rfi"))
+    d["slack_alerted"] = bool(d.get("slack_alerted"))
     return d
 
 
@@ -422,6 +479,32 @@ def get_transaction(txn_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM transactions WHERE txn_id=?", (txn_id,)).fetchone()
         return _row_to_dict(row) if row else None
+
+
+def mark_slack_alerted(txn_id: str):
+    """Flip the one-time flag so a transaction that already triggered a
+    Slack alert doesn't trigger another one on the next retrain (hourly
+    safety-net job, or every webhook event) just because it's still sitting
+    above the risk threshold."""
+    with get_conn() as conn:
+        conn.execute("UPDATE transactions SET slack_alerted=1 WHERE txn_id=?", (txn_id,))
+
+
+def load_slack_oauth_state() -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM slack_oauth_state WHERE id=1").fetchone()
+        return dict(row) if row else None
+
+
+def save_slack_oauth_state(access_token: str, refresh_token: str, expires_at: datetime):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO slack_oauth_state (id, access_token, refresh_token, expires_at)
+               VALUES (1, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET access_token=excluded.access_token,
+                   refresh_token=excluded.refresh_token, expires_at=excluded.expires_at""",
+            (access_token, refresh_token, expires_at.isoformat()),
+        )
 
 
 def record_ingestion_run(started_at, finished_at, strategy_used, scanned_count, new_bank_rfi_count, notes=""):
@@ -1267,6 +1350,218 @@ def process_webhook_event(client: SumsubClient, event: dict) -> dict | None:
 
 
 # ============================================================================
+# Slack alerting -- posts every transaction the MODEL flags as high-risk
+# (predicted_score >= SLACK_ALERT_THRESHOLD) to Slack, via the Web API
+# (chat.postMessage) or an Incoming Webhook -- see slack_configured() /
+# send_slack_alert() below for which one wins. No-ops entirely if neither
+# is configured, so this is safe to leave in place before Slack is set up.
+# ============================================================================
+
+def slack_configured() -> bool:
+    rotating_ready = bool(SLACK_CLIENT_ID and SLACK_CLIENT_SECRET
+                           and (load_slack_oauth_state() or (SLACK_ACCESS_TOKEN and SLACK_REFRESH_TOKEN)))
+    return bool((rotating_ready or (SLACK_BOT_TOKEN)) and SLACK_CHANNEL) or bool(SLACK_WEBHOOK_URL)
+
+
+def _get_valid_slack_access_token() -> str | None:
+    """Returns a currently-valid rotating Slack access token, refreshing it
+    first via oauth.v2.access if the stored one is missing/expired/about to
+    expire. Returns None if the rotating-token flow isn't configured at all
+    (SLACK_CLIENT_ID/SLACK_CLIENT_SECRET missing) -- callers should fall
+    back to SLACK_BOT_TOKEN or the webhook in that case, see send_slack_alert.
+
+    Why this exists: Slack's token-rotation access tokens
+    (xoxe.xoxb-.../xoxe.xoxp-...) expire in ~12 hours and MUST be exchanged
+    for a new pair via the refresh token before then -- unlike a classic
+    static xoxb-... bot token, which never expires. Each refresh also
+    invalidates the refresh token just used and issues a new one, so the
+    live pair is persisted in the slack_oauth_state table (seeded once from
+    SLACK_ACCESS_TOKEN/SLACK_REFRESH_TOKEN) rather than re-read from the env
+    vars every time -- the env vars are only good for the very first call."""
+    if not (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET):
+        return None
+
+    state = load_slack_oauth_state()
+    if state is None:
+        if not (SLACK_ACCESS_TOKEN and SLACK_REFRESH_TOKEN):
+            return None
+        # First-ever call: seed from the env vars but treat the seed as
+        # already expired (datetime.min) so the block below immediately
+        # refreshes it. We don't know the true remaining lifetime of a
+        # pasted-in access token, so starting from a forced refresh
+        # establishes a known-good expires_at rather than guessing.
+        save_slack_oauth_state(SLACK_ACCESS_TOKEN, SLACK_REFRESH_TOKEN, datetime.min)
+        state = load_slack_oauth_state()
+
+    expires_at = datetime.min
+    if state.get("expires_at"):
+        try:
+            expires_at = datetime.fromisoformat(state["expires_at"])
+        except ValueError:
+            pass
+
+    # Written as "now + buffer < expires_at" rather than "now < expires_at -
+    # buffer" so this never subtracts from the datetime.min sentinel (a
+    # forced-refresh seed) and overflows -- adding a few minutes to "now" is
+    # always safe.
+    if datetime.utcnow() + timedelta(seconds=SLACK_TOKEN_REFRESH_BUFFER_SECONDS) < expires_at:
+        return state["access_token"]  # still comfortably valid -- no network call needed
+
+    try:
+        resp = requests.post(
+            "https://slack.com/api/oauth.v2.access",
+            data={
+                "client_id": SLACK_CLIENT_ID,
+                "client_secret": SLACK_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": state["refresh_token"],
+            },
+            timeout=10,
+        )
+        body = resp.json()
+    except Exception:  # noqa: BLE001 -- a refresh hiccup must never break ingestion/retraining
+        logger.exception("Slack token refresh request failed -- using last-known access token")
+        return state.get("access_token")
+
+    if not body.get("ok"):
+        logger.warning("Slack token refresh failed: %s", body)
+        return state.get("access_token")
+
+    new_access_token = body.get("access_token")
+    new_refresh_token = body.get("refresh_token") or state["refresh_token"]
+    expires_in = int(body.get("expires_in") or 43200)  # Slack's default rotating-token lifetime is 12h (43200s)
+    new_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+    save_slack_oauth_state(new_access_token, new_refresh_token, new_expires_at)
+    logger.info("Refreshed Slack access token -- valid until %s UTC", new_expires_at.isoformat())
+    return new_access_token
+
+
+def send_slack_alert(text: str, blocks: list[dict] | None = None) -> bool:
+    """Delivers via the Slack Web API, preferring the rotating token pair
+    (SLACK_CLIENT_ID/SECRET + SLACK_ACCESS_TOKEN/SLACK_REFRESH_TOKEN) if
+    configured, then a classic static SLACK_BOT_TOKEN, then falling back to
+    SLACK_WEBHOOK_URL; otherwise no-ops. See the config comment above
+    SLACK_CLIENT_ID for how to set up each path."""
+    if SLACK_CHANNEL:
+        rotating_token = _get_valid_slack_access_token()
+        if rotating_token:
+            return _send_via_slack_api(rotating_token, text, blocks)
+        if SLACK_BOT_TOKEN:
+            return _send_via_slack_api(SLACK_BOT_TOKEN, text, blocks)
+    if SLACK_WEBHOOK_URL:
+        return _send_via_webhook(text, blocks)
+    logger.info(
+        "Slack isn't configured (set SLACK_CLIENT_ID+SLACK_CLIENT_SECRET+SLACK_ACCESS_TOKEN+SLACK_REFRESH_TOKEN+"
+        "SLACK_CHANNEL, or SLACK_BOT_TOKEN+SLACK_CHANNEL, or SLACK_WEBHOOK_URL) -- skipping alert: %s", text,
+    )
+    return False
+
+
+def _send_via_slack_api(token: str, text: str, blocks: list[dict] | None) -> bool:
+    payload: dict = {"channel": SLACK_CHANNEL, "text": text}
+    if blocks:
+        payload["blocks"] = blocks
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+            json=payload, timeout=10,
+        )
+        # chat.postMessage always replies HTTP 200 with JSON, even on
+        # failure -- the real success/failure signal is the "ok" field
+        # (errors like "not_in_channel", "channel_not_found", "invalid_auth"
+        # come back this way, not as a non-200 status).
+        body = {}
+        try:
+            body = resp.json()
+        except ValueError:
+            pass
+        if not body.get("ok"):
+            logger.warning("Slack API chat.postMessage failed (HTTP %s): %s", resp.status_code, body or resp.text[:300])
+            return False
+        return True
+    except Exception:  # noqa: BLE001 -- a Slack hiccup must never break ingestion/retraining
+        logger.exception("Slack API request failed")
+        return False
+
+
+def _send_via_webhook(text: str, blocks: list[dict] | None) -> bool:
+    payload: dict = {"text": text}
+    if blocks:
+        payload["blocks"] = blocks
+    try:
+        resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code != 200:
+            # Slack's Incoming Webhook endpoint replies with plain "ok" (200)
+            # on success and a short plain-text error otherwise (e.g.
+            # "invalid_payload", "channel_not_found") -- log the body since
+            # there's no JSON to parse.
+            logger.warning("Slack webhook alert failed (HTTP %s): %s", resp.status_code, resp.text[:300])
+            return False
+        return True
+    except Exception:  # noqa: BLE001 -- a Slack hiccup must never break ingestion/retraining
+        logger.exception("Slack webhook request failed")
+        return False
+
+
+def _format_slack_alert(score: dict, txn: dict) -> tuple[str, list[dict]]:
+    pct = f"{score['risk_score'] * 100:.0f}%"
+    amount = txn.get("amount")
+    currency = txn.get("currency") or ""
+    country = txn.get("counterparty_country") or "unknown"
+    reasons = score.get("reasons") or []
+    reason_text = "\n".join(f"• {r}" for r in reasons[:3]) or (
+        "No single dominant reason -- a combination of weaker signals pushed this over the threshold."
+    )
+    fallback_text = (
+        f":rotating_light: Flagged transaction -- {pct} predicted bank-RFI risk "
+        f"(`{score['txn_id']}`, {amount} {currency}, counterparty: {country})"
+    )
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text",
+                                     "text": f"\U0001F6A8 Flagged transaction -- {pct} predicted bank-RFI risk"[:150]}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Transaction ID:*\n`{score['txn_id']}`"},
+            {"type": "mrkdwn", "text": f"*Risk score:*\n{pct}"},
+            {"type": "mrkdwn", "text": f"*Amount:*\n{amount} {currency}".strip()},
+            {"type": "mrkdwn", "text": f"*Counterparty country:*\n{country}"},
+        ]},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Why:*\n{reason_text}"}},
+    ]
+    return fallback_text, blocks
+
+
+def check_and_send_slack_alerts():
+    """Called after every retrain (see retrain_only). Re-scores the
+    candidate pool, and for any transaction that has just crossed
+    SLACK_ALERT_THRESHOLD and hasn't been alerted on before, posts it to
+    Slack and flips its slack_alerted flag -- so each transaction the model
+    flags posts exactly once, not again on every subsequent hourly retrain
+    while its score stays elevated."""
+    if not slack_configured() or _current_bundle is None:
+        return
+    try:
+        txns = all_transactions()
+        candidates = transactions_since_last_bank_rfi(txns)
+        if not candidates:
+            return
+        by_id = {t["txn_id"]: t for t in txns}
+        scored = score_all_open(candidates, txns, _current_bundle)
+        for s in scored:
+            if s["risk_score"] < SLACK_ALERT_THRESHOLD:
+                continue
+            txn = by_id.get(s["txn_id"])
+            if not txn or txn.get("slack_alerted"):
+                continue
+            text, blocks = _format_slack_alert(s, txn)
+            if send_slack_alert(text, blocks):
+                mark_slack_alerted(s["txn_id"])
+                logger.info("Slack-alerted txn %s (risk_score=%.3f)", s["txn_id"], s["risk_score"])
+    except Exception:  # noqa: BLE001 -- alerting must never break retraining
+        logger.exception("Slack alert sweep failed")
+
+
+# ============================================================================
 # FastAPI app -- routes, background scheduler, live credential check.
 # ============================================================================
 
@@ -1342,6 +1637,7 @@ def retrain_only():
                 metrics={"n_training_rows": len(txns)}, feature_importances=_feature_importances(_current_bundle),
             )
             logger.info("Retrained model in %s mode on %d transactions", _current_bundle.mode, len(txns))
+            check_and_send_slack_alerts()
         else:
             logger.info("No transactions in the database yet -- nothing to train on.")
     except Exception:
@@ -1406,6 +1702,15 @@ def api_setup(request: Request):
         "total_bank_rfi": len([t for t in txns if t["is_bank_rfi"]]),
         "bank_rfi_tag": BANK_RFI_TAG,
         "ingest_interval_minutes": INGEST_INTERVAL_MINUTES,
+        "slack_configured": slack_configured(),
+        "slack_mode": (
+            "api_rotating" if (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET and SLACK_CHANNEL
+                                and (load_slack_oauth_state() or (SLACK_ACCESS_TOKEN and SLACK_REFRESH_TOKEN)))
+            else "api_static" if (SLACK_BOT_TOKEN and SLACK_CHANNEL)
+            else "webhook" if SLACK_WEBHOOK_URL
+            else "none"
+        ),
+        "slack_alert_threshold": SLACK_ALERT_THRESHOLD,
     }
 
 
@@ -1481,6 +1786,22 @@ def api_model_history():
 def api_trigger_ingest():
     run_ingest_and_retrain()
     return {"status": "completed", "summary": api_summary()}
+
+
+@app.post("/api/slack/test")
+def api_slack_test():
+    """Sends one harmless test message to the configured Slack channel, so
+    the Slack wiring (API token+channel, or webhook URL) can be verified
+    without waiting for a real transaction to cross the risk threshold."""
+    if not slack_configured():
+        return JSONResponse(
+            {"error": "Slack isn't set up yet -- set SLACK_CLIENT_ID+SLACK_CLIENT_SECRET+SLACK_ACCESS_TOKEN+"
+                      "SLACK_REFRESH_TOKEN+SLACK_CHANNEL (rotating token), or SLACK_BOT_TOKEN+SLACK_CHANNEL "
+                      "(static token), or SLACK_WEBHOOK_URL, in Render's Environment tab and redeploy."},
+            status_code=400,
+        )
+    ok = send_slack_alert(":white_check_mark: Bank RFI Prediction Bot -- Slack alerting is connected and working.")
+    return {"sent": ok}
 
 
 def _run_import_job_in_background(client: SumsubClient, raw_ids: list[str]):
