@@ -21,6 +21,26 @@ services:
         sync: false          # <-- your rotated secret key goes here, in the Render dashboard only
       - key: INGEST_INTERVAL_MINUTES
         value: "60"
+      # Slack alerting -- pick ONE method, tried in this order:
+      #   1. Rotating token: set SLACK_CLIENT_ID + SLACK_CLIENT_SECRET + SLACK_ACCESS_TOKEN + SLACK_REFRESH_TOKEN + SLACK_CHANNEL
+      #   2. Static token:   set SLACK_BOT_TOKEN + SLACK_CHANNEL (used only if #1 isn't fully set)
+      #   3. Webhook:        set SLACK_WEBHOOK_URL (used only if neither #1 nor #2 is set)
+      - key: SLACK_CLIENT_ID
+        sync: false          # <-- Slack app's Client ID (Basic Information -> App Credentials), in the Render dashboard only
+      - key: SLACK_CLIENT_SECRET
+        sync: false          # <-- Slack app's Client Secret, in the Render dashboard only
+      - key: SLACK_ACCESS_TOKEN
+        sync: false          # <-- starting rotating access token (xoxe.xoxb-... / xoxe.xoxp-...), in the Render dashboard only -- only used once to bootstrap the first refresh
+      - key: SLACK_REFRESH_TOKEN
+        sync: false          # <-- starting refresh token (xoxe-1-...), in the Render dashboard only -- only used once, a new one is stored internally after that
+      - key: SLACK_BOT_TOKEN
+        sync: false          # <-- classic non-expiring bot token (xoxb-...) with chat:write scope, in the Render dashboard only -- alternative to the rotating pair above
+      - key: SLACK_CHANNEL
+        value: "#potential-bank-rfi-alerts"
+      - key: SLACK_WEBHOOK_URL
+        sync: false          # <-- Slack Incoming Webhook URL, in the Render dashboard only -- only needed if not using either token method above
+      - key: SLACK_ALERT_THRESHOLD
+        value: "0.7"          # post to Slack when a transaction's predicted risk score is >= this (0-1)
 
 # Works as-is on Render's Free plan with zero further changes -- the only
 # tradeoff is that the SQLite database (and therefore everything the bot has
