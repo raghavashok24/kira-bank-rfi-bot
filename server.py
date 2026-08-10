@@ -151,6 +151,52 @@ WEBHOOK_DIGEST_ALGOS = {
     "HMAC_SHA1_HEX": hashlib.sha1,
 }
 
+# Optional: post-to-Slack notifications. Entirely off (every send_slack_
+# message call becomes a silent no-op) unless BOTH of these are set -- the
+# bot works exactly the same without Slack configured at all. Get a bot
+# token from a Slack app with the chat:write scope, installed to the
+# target workspace; SLACK_CHANNEL is the channel ID or name (e.g. "#kyt-
+# alerts") the bot has been invited to. Same rule as the Sumsub secrets:
+# only ever set these in Render's Environment tab, never in chat, a ticket,
+# or committed code.
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")
+# Risk score (0-1) at or above which a newly-changed prediction triggers a
+# Slack alert -- see notify_new_high_risk_predictions. Deliberately only
+# fires for predictions that are NEW or materially changed since the last
+# retrain (via log_predictions' dedup), not every candidate on every
+# retrain, so this can't spam the channel.
+SLACK_HIGH_RISK_THRESHOLD = float(os.environ.get("SLACK_HIGH_RISK_THRESHOLD", "0.75"))
+
+
+def send_slack_message(text: str) -> bool:
+    """Best-effort Slack post via chat.postMessage. Deliberately never
+    raises -- a Slack outage, a wrong token, or SLACK_BOT_TOKEN/
+    SLACK_CHANNEL simply not being set yet must never be able to break
+    ingestion, training, or the webhook response path, all of which call
+    this. Returns False (and logs why) on any failure instead."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL:
+        return False
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": SLACK_CHANNEL, "text": text},
+            timeout=10,
+        )
+        body = {}
+        try:
+            body = resp.json()
+        except ValueError:
+            pass
+        if not body.get("ok"):
+            logger.warning("Slack message rejected: %s", body.get("error") or f"HTTP {resp.status_code}")
+            return False
+        return True
+    except Exception:  # noqa: BLE001 -- Slack must never be able to break the caller
+        logger.exception("Failed to send Slack message")
+        return False
+
 
 def _normalize_tag(text: str) -> str:
     """Case-insensitive, separator-insensitive tag comparison key -- so a tag
@@ -746,7 +792,7 @@ def delete_transaction(txn_id: str):
         conn.execute("DELETE FROM transactions WHERE txn_id=?", (txn_id,))
 
 
-def log_predictions(scored: list[dict]):
+def log_predictions(scored: list[dict]) -> list[dict]:
     """Persists a snapshot of every currently-scored candidate transaction
     into predictions_log -- so "every newly predicted transaction" leaves a
     durable, queryable record instead of being computed fresh and discarded
@@ -757,24 +803,73 @@ def log_predictions(scored: list[dict]):
     right now." Skips re-inserting a row for a transaction whose score
     hasn't meaningfully changed since its last logged entry, so this table
     doesn't grow by (candidates x retrains) when most retrains don't
-    actually move most scores."""
+    actually move most scores.
+
+    Returns the subset of `scored` that was actually newly logged (new
+    candidate or materially changed score) -- callers use this (see
+    notify_new_high_risk_predictions) to react only to real changes, not
+    every candidate on every retrain."""
     if not scored:
-        return
+        return []
     with get_conn() as conn:
         last_scores = dict(conn.execute(
             "SELECT txn_id, risk_score FROM predictions_log WHERE id IN "
             "(SELECT MAX(id) FROM predictions_log GROUP BY txn_id)"
         ).fetchall())
         rows = []
+        changed = []
         for s in scored:
             prev = last_scores.get(s["txn_id"])
             if prev is not None and abs(prev - s["risk_score"]) < 0.005:
                 continue
             rows.append((s["txn_id"], s["risk_score"], s.get("mode"), json.dumps(s.get("reasons") or [])))
+            changed.append(s)
         if rows:
             conn.executemany(
                 "INSERT INTO predictions_log (txn_id, risk_score, mode, reasons_json) VALUES (?,?,?,?)", rows,
             )
+    return changed
+
+
+def notify_new_high_risk_predictions(changed: list[dict]) -> None:
+    """Slack alert for predictions that just newly crossed (or moved while
+    already above) SLACK_HIGH_RISK_THRESHOLD -- fed only the `changed`
+    subset log_predictions actually wrote, so this can't spam the channel
+    with the same steady-state high scores on every single retrain. A
+    no-op (checked inside send_slack_message) if Slack isn't configured."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL:
+        return
+    high = [c for c in (changed or []) if (c.get("risk_score") or 0) >= SLACK_HIGH_RISK_THRESHOLD]
+    if not high:
+        return
+    high.sort(key=lambda c: -(c.get("risk_score") or 0))
+    lines = [
+        f"• `{c['txn_id']}` — {c['risk_score']*100:.1f}% — "
+        f"{(c.get('reasons') or ['no specific reason matched'])[0]}"
+        for c in high[:10]
+    ]
+    more = f"\n…and {len(high) - 10} more." if len(high) > 10 else ""
+    text = (
+        f":rotating_light: *Bank RFI Bot -- {len(high)} transaction(s) newly scored high-risk "
+        f"(≥{SLACK_HIGH_RISK_THRESHOLD*100:.0f}%) for \"bank rfi\"*\n" + "\n".join(lines) + more
+    )
+    send_slack_message(text)
+
+
+def notify_new_bank_rfi_tag(row: dict) -> None:
+    """Slack alert the moment a transaction is actually confirmed as
+    "bank rfi" on Sumsub (as opposed to merely predicted) -- ground truth,
+    not a model opinion. No-op if Slack isn't configured."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL:
+        return
+    text = (
+        f":triangular_flag_on_post: *New \"bank rfi\" transaction confirmed on Sumsub*\n"
+        f"• Txn ID: `{row.get('txn_id')}`\n"
+        f"• Amount: {row.get('amount')} {row.get('currency') or ''}\n"
+        f"• Applicant: {row.get('applicant_id') or 'unknown'}\n"
+        f"• Counterparty country: {row.get('counterparty_country') or 'unknown'}"
+    )
+    send_slack_message(text)
 
 
 def prediction_history(txn_id: str, limit: int = 50) -> list[dict]:
@@ -1107,6 +1202,10 @@ class ModelBundle:
         self.train_matrix = train_matrix
         self.pattern_findings = pattern_findings
         self.metrics = metrics or {}
+        # Set right after construction in train_model, not here -- a plain
+        # attribute (not a constructor arg) so it survives pickling via
+        # save_model_state/load_model_state with zero extra plumbing.
+        self.trained_at = None
 
 
 def _cross_val_metric(base_clf_factory, X: np.ndarray, y: np.ndarray, cv_folds: int, scoring: str) -> float | None:
@@ -1381,6 +1480,7 @@ def train_model(transactions: list[dict]) -> ModelBundle:
             },
         )
 
+    bundle.trained_at = datetime.now(timezone.utc).isoformat()
     return bundle
 
 
@@ -1949,9 +2049,16 @@ def process_webhook_event(client: SumsubClient, event: dict) -> tuple[dict | Non
     if not kyt_txn_id:
         return None, f"no kytTxnId/kytDataTxnId on this {event_type} event -- nothing to fetch"
 
+    # Captured BEFORE ingest_single_txn overwrites the local row, so the
+    # caller can tell "just became bank-rfi" apart from "already was
+    # bank-rfi, this is just a later review-outcome event for the same
+    # transaction" -- see notify_new_bank_rfi_tag, which should fire once
+    # per transaction, not once per webhook event about it.
+    was_bank_rfi_before = bool((get_transaction(kyt_txn_id) or {}).get("is_bank_rfi"))
     row = ingest_single_txn(client, kyt_txn_id)
     if row is None:
         return None, f"ingest_single_txn failed for {kyt_txn_id} (see server logs for the exact Sumsub error)"
+    row["_newly_bank_rfi"] = bool(row.get("is_bank_rfi")) and not was_bank_rfi_before
     return row, "ok"
 
 
@@ -2047,7 +2154,8 @@ def retrain_only():
             try:
                 candidates = transactions_since_last_bank_rfi(txns)
                 scored = score_all_open(candidates, txns, _current_bundle)
-                log_predictions(scored)
+                changed = log_predictions(scored)
+                notify_new_high_risk_predictions(changed)
             except Exception:
                 logger.exception("Failed to log predictions snapshot (retrain itself succeeded)")
         else:
@@ -2093,9 +2201,19 @@ def _ensure_bundle_loaded():
         _current_bundle = load_model_state()
         if _current_bundle is not None:
             return
-        txns = all_transactions()
-        if txns:
-            _current_bundle = train_model(txns)
+        # No cached model to resume from -- if the database already has
+        # data (first-ever boot against an existing DB, or the cache
+        # didn't survive a restart), train immediately through the SAME
+        # path retrain_only() uses rather than duplicating a partial
+        # version of it here. That matters: it means this also records the
+        # model version (so /api/model/history and the dashboard's "Model
+        # mode" tile are correct immediately, not just _current_bundle in
+        # memory), caches the result for the next restart, and logs/alerts
+        # on today's already-open candidates instead of silently waiting
+        # for the next webhook event or scheduled sweep to do that
+        # bookkeeping.
+        if all_transactions():
+            retrain_only()
 
 
 def _maybe_auto_backfill_on_empty_db():
@@ -2146,19 +2264,78 @@ def _maybe_auto_backfill_on_empty_db():
     threading.Thread(target=_run_backfill_history_job_in_background, args=(client, months_back), daemon=True).start()
 
 
+def notify_startup_status() -> None:
+    """One Slack message per process start -- a live, independent "yes,
+    this is actually running" signal that doesn't require opening the
+    Render dashboard or logs. No-op if Slack isn't configured. Deliberately
+    called from inside on_startup's own try/except wrapper (see below), and
+    is itself defensive about every value it reads, so a problem generating
+    this message can never be the thing that takes the app down."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL:
+        logger.info("SLACK_BOT_TOKEN/SLACK_CHANNEL not set -- skipping startup Slack notification.")
+        return
+    try:
+        txns = all_transactions()
+    except Exception:  # noqa: BLE001
+        txns = []
+    mode = _current_bundle.mode if _current_bundle else "untrained (no model loaded yet)"
+    creds_status = "configured" if (os.environ.get("SUMSUB_APP_TOKEN") and os.environ.get("SUMSUB_SECRET_KEY")) else "MISSING"
+    webhook_sig = "on" if SUMSUB_WEBHOOK_SECRET_KEY else "off (SUMSUB_WEBHOOK_SECRET_KEY not set -- webhook accepts unverified POSTs)"
+    text = (
+        f":bank: *Bank RFI Prediction Bot started*\n"
+        f"• Transactions in database: {len(txns)}\n"
+        f"• Model mode: {mode}\n"
+        f"• Sumsub credentials: {creds_status}\n"
+        f"• Webhook signature verification: {webhook_sig}"
+    )
+    send_slack_message(text)
+
+
 @app.on_event("startup")
 def on_startup():
-    _ensure_bundle_loaded()
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(run_ingest_and_retrain, "interval", minutes=INGEST_INTERVAL_MINUTES,
-                       next_run_time=datetime.now(timezone.utc))
-    scheduler.start()
-    app.state.scheduler = scheduler
-    logger.info(
-        "Safety-net backfill+retrain scheduled every %d minute(s) -- but the model actually "
-        "retrains immediately on every webhook event, not on this timer.", INGEST_INTERVAL_MINUTES,
-    )
-    _maybe_auto_backfill_on_empty_db()
+    """Every step here is independently wrapped in try/except: a startup
+    handler that raises makes FastAPI/Uvicorn fail to start AT ALL --
+    every single route, including the dashboard and /api/health -- so a
+    latent bug in any ONE of these (a corrupt persisted model, a scheduler
+    misconfiguration, a Sumsub network hiccup during the empty-db check)
+    must never be allowed to take the whole application down with it. Each
+    step logs and continues if it fails; the app coming up in a partially-
+    degraded state (e.g. no cached model yet, but the webhook and dashboard
+    both working) is always strictly better than the app not coming up at
+    all."""
+    try:
+        _ensure_bundle_loaded()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to load/train an initial model bundle at startup -- continuing without one; "
+            "the next webhook event or scheduled retrain will populate it."
+        )
+    try:
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(run_ingest_and_retrain, "interval", minutes=INGEST_INTERVAL_MINUTES,
+                           next_run_time=datetime.now(timezone.utc))
+        scheduler.start()
+        app.state.scheduler = scheduler
+        logger.info(
+            "Safety-net backfill+retrain scheduled every %d minute(s) -- but the model actually "
+            "retrains immediately on every webhook event, not on this timer.", INGEST_INTERVAL_MINUTES,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to start the background scheduler -- webhook-driven retraining still works; "
+            "the hourly safety-net sweep will not run until the next restart."
+        )
+    try:
+        _maybe_auto_backfill_on_empty_db()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Auto-backfill-on-empty-db check failed at startup -- not fatal, use the dashboard's "
+            "manual \"Run full historical backfill\" button instead."
+        )
+    try:
+        notify_startup_status()
+    except Exception:  # noqa: BLE001
+        logger.exception("Startup Slack notification failed (non-fatal)")
 
 
 def _db_likely_ephemeral() -> bool:
@@ -2208,6 +2385,8 @@ def api_setup(request: Request):
         "webhook_signature_verification": "enabled" if SUMSUB_WEBHOOK_SECRET_KEY else "disabled_no_secret",
         "webhook_invalid_signature_count": invalid_sig_count,
         "webhook_types_fully_sig_failing": types_fully_sig_failing,
+        "slack_configured": bool(SLACK_BOT_TOKEN and SLACK_CHANNEL),
+        "slack_high_risk_threshold": SLACK_HIGH_RISK_THRESHOLD,
         "total_transactions": len(txns),
         "total_bank_rfi": rfi_count,
         "total_confirmed_other": n_confirmed_other,
@@ -2230,17 +2409,33 @@ def api_health():
 
 @app.get("/api/summary")
 def api_summary():
+    """IMPORTANT: model_mode/metrics below are read from the LIVE in-memory
+    `_current_bundle` (calling _ensure_bundle_loaded() first so it's
+    populated whenever a model can exist at all), NOT from the
+    `model_versions` DB table. An earlier version read only from
+    `latest_model_version()`, which is only written by retrain_only() --
+    but _ensure_bundle_loaded() (used on every process startup, and
+    lazily by other endpoints) can populate a perfectly good, fully
+    working `_current_bundle` via a restored cache or a fresh train
+    WITHOUT ever calling retrain_only(). That mismatch meant the dashboard
+    could show "Model mode: untrained" right after every restart -- for up
+    to a full INGEST_INTERVAL_MINUTES until the next scheduled retrain --
+    even though predictions were already being computed correctly from a
+    working model the whole time (see api_predictions, which always used
+    `_current_bundle` directly and was never actually broken). That
+    "looks completely broken but isn't" gap is exactly what this fixes:
+    the tile now always reflects what's actually being used to score."""
+    _ensure_bundle_loaded()
     txns = all_transactions()
     rfi = [t for t in txns if t["is_bank_rfi"]]
-    latest_version = latest_model_version()
     cutoff = most_recent_bank_rfi_timestamp(txns)
-    metrics = (latest_version or {}).get("metrics_json") or {}
+    metrics = _current_bundle.metrics if _current_bundle else {}
     return {
         "total_transactions": len(txns), "total_bank_rfi": len(rfi),
         "candidate_transactions": len(transactions_since_last_bank_rfi(txns)),
         "last_bank_rfi_at": cutoff.isoformat() if cutoff else None,
-        "model_mode": latest_version["mode"] if latest_version else "untrained",
-        "model_trained_at": latest_version["trained_at"] if latest_version else None,
+        "model_mode": _current_bundle.mode if _current_bundle else "untrained",
+        "model_trained_at": _current_bundle.trained_at if _current_bundle else None,
         "model_cv_roc_auc": metrics.get("cv_roc_auc"),
         "model_cv_pr_auc": metrics.get("cv_pr_auc"),
         "model_temporal_holdout_roc_auc": metrics.get("temporal_holdout_roc_auc"),
@@ -2277,6 +2472,14 @@ def api_predictions():
         s["currency"] = t.get("currency")
         s["counterparty_country"] = t.get("counterparty_country")
         s["applicant_id"] = t.get("applicant_id")
+        # Timestamps for the dashboard's "time added" column: txn_created_at
+        # is the transaction's own date (from Sumsub); ingested_at is when
+        # THIS BOT first stored/last touched the row -- surfacing both
+        # distinguishes "an old transaction we just backfilled" from "a
+        # transaction that just happened", which matters for judging how
+        # current a candidate list actually is.
+        s["txn_created_at"] = t.get("txn_created_at")
+        s["ingested_at"] = t.get("ingested_at")
         for sim in s.get("similar_bank_rfi_transactions", []):
             past = by_id.get(sim["txn_id"], {})
             sim["tags"] = past.get("tags", [])
@@ -2490,10 +2693,15 @@ def _process_webhook_event_in_background(event: dict, event_row_id: int):
             if row.get("deleted"):
                 tag_note = "transaction deleted on Sumsub"
             elif row.get("is_bank_rfi"):
-                tag_note = "new bank-rfi transaction"
+                tag_note = "new bank-rfi transaction" if row.get("_newly_bank_rfi") else "bank-rfi transaction updated"
             else:
                 tag_note = "transaction update"
             logger.info("Webhook event processed (%s): %s -- retraining now", tag_note, row["txn_id"])
+            if row.get("_newly_bank_rfi"):
+                try:
+                    notify_new_bank_rfi_tag(row)
+                except Exception:  # noqa: BLE001 -- a Slack hiccup must never break webhook processing
+                    logger.exception("Failed to send new-bank-rfi Slack notification (non-fatal)")
             retrain_only()
         else:
             logger.info("Webhook event not ingested: %s", detail)
@@ -2738,6 +2946,8 @@ FRONTEND_HTML = r"""<!doctype html>
             <th data-key="txn_id">Transaction</th>
             <th data-key="amount">Amount</th>
             <th data-key="counterparty_country">Counterparty</th>
+            <th data-key="txn_created_at">Txn date</th>
+            <th data-key="ingested_at">Added to bot</th>
             <th>Top reason</th>
           </tr>
         </thead>
@@ -2837,6 +3047,9 @@ function renderSetup(s) {
     rows.push({icon: "good", text: `<strong>Webhook signature verification is on.</strong> Every incoming POST to the webhook URL is checked against SUMSUB_WEBHOOK_SECRET_KEY before being trusted -- forged/unauthenticated requests are rejected with HTTP 401 and never touch your data.${s.webhook_invalid_signature_count ? ` <strong style="color:var(--status-critical);">${s.webhook_invalid_signature_count} invalid-signature attempt(s) blocked so far</strong> -- check Sumsub's Webhook logs to confirm this matches Sumsub's own delivery attempts (mismatches here usually mean the secret in Render doesn't match the one currently shown in Sumsub's Webhook manager).` : ""}`});
   } else {
     rows.push({icon: "warn", text: `<strong>Webhook signature verification is off.</strong> Any POST to the webhook URL below is currently accepted at face value -- there's no way to tell a real Sumsub event from anyone else who finds this URL. Copy the secret key shown in Sumsub Dashboard &rarr; Webhook manager (when you create or edit the webhook) into Render's Environment tab as <code>SUMSUB_WEBHOOK_SECRET_KEY</code> and redeploy -- never paste it into chat or commit it to code, same as the API credentials. Sumsub signs each request with <code>x-payload-digest</code> / <code>X-Payload-Digest-Alg</code> headers; this bot verifies them the moment that variable is set, no other change needed.`});
+  }
+  if (s.slack_configured) {
+    rows.push({icon: "good", text: `<strong>Slack notifications are on.</strong> A message is posted on every process start, on every new confirmed "${s.bank_rfi_tag}" transaction, and whenever a candidate newly crosses ${(s.slack_high_risk_threshold*100).toFixed(0)}% predicted risk (set via SLACK_HIGH_RISK_THRESHOLD).`});
   }
   if (s.auto_backfill && s.auto_backfill.attempted) {
     rows.push({icon: "warn", text: `<strong>Auto-recovering from an empty database.</strong> ${s.auto_backfill.reason} This can take a few minutes -- refresh this page to see progress, or check the "Run full historical backfill" panel below.`});
@@ -2979,9 +3192,11 @@ function drawPredTable() {
       <td>${r.txn_id}</td>
       <td>${fmt(r.amount)} ${r.currency||""}</td>
       <td>${r.counterparty_country || "–"}</td>
+      <td>${(r.txn_created_at||"").replace("T"," ").slice(0,16) || "–"}</td>
+      <td>${(r.ingested_at||"").replace("T"," ").slice(0,16) || "–"}</td>
       <td>${(r.reasons && r.reasons[0]) || "–"}</td>
     </tr>
-    <tr class="expand-row" id="expand-${i}" style="display:none;"><td colspan="5">
+    <tr class="expand-row" id="expand-${i}" style="display:none;"><td colspan="7">
       <strong>Why:</strong>
       <ul class="reasons">${(r.reasons||[]).map(x => `<li>${x}</li>`).join("") || "<li>No specific reasons matched.</li>"}</ul>
       <strong>Similar past bank-rfi transactions:</strong>
