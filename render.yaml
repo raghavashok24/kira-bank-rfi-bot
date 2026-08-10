@@ -23,6 +23,17 @@ services:
         sync: false          # <-- secret key shown in Sumsub Dashboard -> Webhook manager; verifies
                               #     incoming webhook calls are really from Sumsub. Strongly recommended,
                               #     not strictly required -- the bot runs without it, just unauthenticated.
+      - key: SLACK_BOT_TOKEN
+        sync: false          # <-- optional: bot token (starts "xoxb-") from a Slack app with the
+                              #     chat:write scope, installed to your workspace. Leave unset to run
+                              #     with Slack notifications off -- everything else works the same.
+      - key: SLACK_CHANNEL
+        sync: false          # <-- optional: channel ID or name (e.g. "#kyt-alerts") the bot has been
+                              #     invited to. Both this and SLACK_BOT_TOKEN must be set for Slack
+                              #     notifications to turn on.
+      - key: SLACK_HIGH_RISK_THRESHOLD
+        value: "0.75"         # <-- risk score (0-1) at/above which a newly-changed prediction posts a
+                              #     Slack alert. Optional -- 0.75 is the default even if you delete this.
       - key: INGEST_INTERVAL_MINUTES
         value: "60"
 
