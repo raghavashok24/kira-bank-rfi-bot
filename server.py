@@ -86,6 +86,7 @@ import json
 import logging
 import math
 import os
+import pickle
 import re
 import sqlite3
 import statistics
@@ -107,6 +108,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from scipy import stats as scipy_stats
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.preprocessing import StandardScaler
 
@@ -345,6 +347,22 @@ CREATE TABLE IF NOT EXISTS predictions_log (
     logged_at TEXT DEFAULT CURRENT_TIMESTAMP, txn_id TEXT, risk_score REAL, mode TEXT, reasons_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_predictions_log_txn ON predictions_log(txn_id);
+
+-- Single-row snapshot of the last successfully trained ModelBundle (pickled).
+-- Purpose: so a process restart (Render redeploy, free-tier spin-down/up,
+-- manually reopening the dashboard after it went idle) can resume serving
+-- the model it already learned INSTANTLY instead of sitting in "untrained/
+-- heuristic" limbo until the next full retrain finishes. This does NOT
+-- replace the `transactions` table as the source of truth -- it's a
+-- convenience cache of the last fitted model, always rebuilt (and
+-- overwritten here) on the very next retrain once new data arrives. See
+-- save_model_state/load_model_state.
+CREATE TABLE IF NOT EXISTS model_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    saved_at TEXT,
+    n_transactions_at_save INTEGER,
+    bundle_blob BLOB
+);
 """
 
 # Sumsub's documented reviewStatus values (docs.sumsub.com/docs/transaction-
@@ -544,6 +562,66 @@ def record_model_version(mode, n_bank_rfi, n_other, metrics: dict, feature_impor
                VALUES (datetime('now'), ?, ?, ?, ?, ?)""",
             (n_bank_rfi, n_other, mode, json.dumps(metrics), json.dumps(feature_importances)),
         )
+
+
+def save_model_state(bundle, n_transactions: int) -> None:
+    """Persists the just-trained ModelBundle (classifier, scaler, vocab,
+    pattern findings, metrics -- everything needed to serve predictions)
+    into the SAME sqlite file as the transactions themselves, overwriting
+    the single existing row each time. This is what lets a process restart
+    resume serving the model it already learned instead of starting back at
+    "untrained/heuristic" -- see load_model_state, called from
+    _ensure_bundle_loaded on startup. A pickling failure here must never
+    take down a successful retrain, so it's caught and logged, not raised."""
+    try:
+        blob = pickle.dumps(bundle, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to pickle model bundle for persistence (retrain itself still succeeded)")
+        return
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO model_state (id, saved_at, n_transactions_at_save, bundle_blob)
+                   VALUES (1, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       saved_at=excluded.saved_at,
+                       n_transactions_at_save=excluded.n_transactions_at_save,
+                       bundle_blob=excluded.bundle_blob""",
+                (datetime.now(timezone.utc).isoformat(), n_transactions, blob),
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to save model state to the database (retrain itself still succeeded)")
+
+
+def load_model_state():
+    """Restores the last-persisted ModelBundle, if any. Returns None (never
+    raises) on any problem -- a missing/corrupt/incompatible snapshot just
+    means the caller falls back to training fresh from the transactions
+    table, which is always correct even if slower. NOTE: this snapshot
+    lives in the same sqlite file as `transactions` -- on a platform with no
+    persistent disk (see _db_likely_ephemeral), a real restart wipes both
+    together, so this bridges in-process restarts / soft redeploys where
+    the disk survives, not a full ephemeral wipe. When the disk IS wiped,
+    this correctly returns None and the normal auto-backfill-then-retrain
+    path (see _maybe_auto_backfill_on_empty_db) rebuilds everything from
+    Sumsub, which remains the actual durable source of truth."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT bundle_blob, saved_at, n_transactions_at_save FROM model_state WHERE id = 1"
+            ).fetchone()
+        if not row or not row["bundle_blob"]:
+            return None
+        bundle = pickle.loads(row["bundle_blob"])
+        logger.info(
+            "Restored previously-trained model from the database (saved_at=%s, %d transaction(s) at save "
+            "time) -- resuming from there instead of starting untrained.",
+            row["saved_at"], row["n_transactions_at_save"],
+        )
+        return bundle
+    except Exception:  # noqa: BLE001 -- any restore failure just means "train fresh instead"
+        logger.exception("Failed to restore persisted model state (will train fresh instead)")
+        return None
 
 
 def latest_model_version() -> dict | None:
@@ -1031,25 +1109,120 @@ class ModelBundle:
         self.metrics = metrics or {}
 
 
-def _cv_roc_auc(base_clf_factory, X: np.ndarray, y: np.ndarray, cv_folds: int) -> float | None:
+def _cross_val_metric(base_clf_factory, X: np.ndarray, y: np.ndarray, cv_folds: int, scoring: str) -> float | None:
     """Actual measured predictive performance, not just "it's in ML mode
-    now": stratified k-fold cross-validated ROC-AUC using a FRESH classifier
-    per fold (never the one fit on all the data), so this number reflects
-    how well the model separates real held-out bank-rfi cases from
-    confirmed-negative ones. Surfaced on every model version so "is this
-    actually predicting anything" has a real answer instead of vibes. 0.5 =
-    no better than random; 1.0 = perfect separation. Returns None (not 0.5)
-    when there isn't enough data to fold reliably, so the dashboard can say
-    "not enough data yet" instead of implying "no better than random"."""
+    now": stratified k-fold cross-validation using a FRESH classifier per
+    fold (never the one fit on all the data), so this number reflects how
+    well the model separates real held-out bank-rfi cases from confirmed-
+    negative ones. Surfaced on every model version so "is this actually
+    predicting anything" has a real answer instead of vibes. Returns None
+    (not a misleading default) when there isn't enough data to fold
+    reliably, so the dashboard can say "not enough data yet" instead of
+    implying "no better than random".
+
+    Called with two different `scoring` values (see train_model): "roc_auc"
+    and "average_precision" (precision-recall AUC). Both are reported
+    because with only a few dozen bank-rfi positives -- a genuinely rare
+    event even within the already-filtered "confirmed" training set -- ROC-
+    AUC alone can look deceptively strong: it rewards ranking the many true
+    negatives correctly, which is the easy part when negatives vastly
+    outnumber positives. PR-AUC focuses on how well the model finds the
+    positives specifically (precision among what it flags, recall of what
+    it catches), which is the metric that actually matters for a rare-event
+    early-warning system and is far less forgiving of a model that's
+    secretly just predicting "not bank-rfi" most of the time."""
     if cv_folds < 2:
         return None
     try:
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=0)
-        scores = cross_val_score(base_clf_factory(), X, y, cv=skf, scoring="roc_auc")
+        scores = cross_val_score(base_clf_factory(), X, y, cv=skf, scoring=scoring)
         return round(float(np.mean(scores)), 4)
     except Exception:  # noqa: BLE001 -- a metric failing must never block training
-        logger.exception("CV ROC-AUC computation failed")
+        logger.exception("CV %s computation failed", scoring)
         return None
+
+
+# How much of the confirmed (bank-rfi + confirmed-other) dataset, sorted
+# chronologically by transaction date, is held out as a genuine unseen-in-
+# training TEST set for _temporal_holdout_metrics -- as opposed to the
+# random k-fold CV above, this specifically tests "does the model trained
+# on older data still work on the most recent transactions", i.e. whether
+# it's keeping up with trend drift rather than just memorizing history.
+TEMPORAL_HOLDOUT_FRACTION = 0.2
+# Below this many examples of a class in either the train or test slice,
+# the split is too small to mean anything (a handful of examples can flip
+# an AUC from 0.9 to 0.4 on pure noise) -- reported as "not enough data
+# yet" rather than a number that looks precise but isn't.
+MIN_HOLDOUT_PER_CLASS = 5
+
+
+def _temporal_holdout_metrics(labeled_feats: list[dict], vocab: dict) -> dict:
+    """A REAL train/test split, not just cross-validation: sorts every
+    labeled (bank-rfi + confirmed-other) example by its own transaction
+    timestamp, trains a classifier ONLY on the older ~80%, and evaluates it
+    on the newest ~20% -- data the training process never saw in any form,
+    including for fitting the scaler. This is deliberately separate from
+    the deployed model (which is trained on 100% of labeled data, since
+    with only a few dozen bank-rfi positives, throwing away a temporal
+    slice permanently would hurt the model actually serving predictions) --
+    it exists purely as an honest, periodically-recomputed answer to "would
+    this approach have caught last month's bank-rfi cases using only what
+    was known before them", which cross-validation (random shuffling across
+    all of history) cannot answer on its own. A large gap between this and
+    the CV metrics above is the clearest possible signal of trend drift --
+    i.e. the patterns that predicted bank-rfi a year ago no longer look like
+    the patterns predicting it now."""
+    n = len(labeled_feats)
+    if n < 2 * MIN_HOLDOUT_PER_CLASS:
+        return {"temporal_holdout_note": f"Only {n} labeled example(s) total -- too few for a temporal holdout yet."}
+
+    ordered = sorted(range(n), key=lambda i: labeled_feats[i].get("_created_at") or datetime.min)
+    n_test = max(1, round(n * TEMPORAL_HOLDOUT_FRACTION))
+    test_idx = set(ordered[-n_test:])
+    train_feats = [labeled_feats[i] for i in range(n) if i not in test_idx]
+    test_feats = [labeled_feats[i] for i in ordered[-n_test:]]
+
+    y_train = np.array([1 if f["_is_bank_rfi"] else 0 for f in train_feats])
+    y_test = np.array([1 if f["_is_bank_rfi"] else 0 for f in test_feats])
+    n_pos_train, n_neg_train = int(y_train.sum()), int(len(y_train) - y_train.sum())
+    n_pos_test, n_neg_test = int(y_test.sum()), int(len(y_test) - y_test.sum())
+
+    if min(n_pos_train, n_neg_train, n_pos_test, n_neg_test) < MIN_HOLDOUT_PER_CLASS:
+        return {
+            "temporal_holdout_note": (
+                f"Not enough of both classes on both sides of a chronological split yet "
+                f"(train: {n_pos_train} bank-rfi / {n_neg_train} other, test: {n_pos_test} bank-rfi / "
+                f"{n_neg_test} other -- need at least {MIN_HOLDOUT_PER_CLASS} of each on each side). "
+                f"This resolves itself as more confirmed examples accumulate over time."
+            ),
+        }
+
+    try:
+        # Fresh scaler fit ONLY on the training slice -- fitting it on the
+        # full labeled set (train+test) would leak test-set statistics into
+        # preprocessing, which is a real (if subtle) form of the exact
+        # train/test contamination this function exists to avoid.
+        holdout_scaler = StandardScaler()
+        X_train = _vectorize(train_feats, vocab, holdout_scaler, fit_scaler=True)
+        X_test = _vectorize(test_feats, vocab, holdout_scaler, fit_scaler=False)
+        holdout_clf = LogisticRegression(max_iter=3000, class_weight="balanced", C=0.3)
+        holdout_clf.fit(X_train, y_train)
+        probs = holdout_clf.predict_proba(X_test)[:, 1]
+        return {
+            "temporal_holdout_n_train": len(train_feats),
+            "temporal_holdout_n_test": len(test_feats),
+            "temporal_holdout_roc_auc": round(float(roc_auc_score(y_test, probs)), 4),
+            "temporal_holdout_pr_auc": round(float(average_precision_score(y_test, probs)), 4),
+            "temporal_holdout_note": (
+                f"Classifier trained ONLY on the oldest {len(train_feats)} labeled examples, evaluated on "
+                f"the newest {len(test_feats)} it never saw during training or preprocessing -- a real "
+                f"held-out test set, not resampled cross-validation. A much lower score here than the "
+                f"cross-validated AUC above suggests the model isn't keeping up with recent trend changes."
+            ),
+        }
+    except Exception:  # noqa: BLE001 -- a metric failing must never block training
+        logger.exception("Temporal holdout evaluation failed")
+        return {"temporal_holdout_note": "Temporal holdout evaluation failed (see server logs) -- ignored, training continued."}
 
 
 def train_model(transactions: list[dict]) -> ModelBundle:
@@ -1087,12 +1260,39 @@ def train_model(transactions: list[dict]) -> ModelBundle:
     review has actually concluded without that tag. Currently-open
     transactions are still fully eligible to be SCORED (see
     score_all_open) -- they're just excluded from teaching the model what
-    "not risky" looks like until their own outcome is actually known."""
+    "not risky" looks like until their own outcome is actually known.
+
+    RARE-EVENT NOTE: a real account here typically has on the order of a
+    few dozen confirmed bank-rfi examples against a much larger pool of
+    everything else -- textbook class imbalance, not just "a small
+    dataset". Three separate things account for that, not just one:
+    class_weight="balanced" re-weights the loss so the rare positive class
+    isn't drowned out, StratifiedKFold (both for CalibratedClassifierCV's
+    internal folds and for the CV metrics below) keeps the true bank-rfi
+    ratio intact in every fold instead of risking a fold with zero
+    positives, and both ROC-AUC and PR-AUC (precision-recall AUC) are
+    computed and reported side by side -- PR-AUC specifically because
+    ROC-AUC alone can look artificially strong under imbalance (see
+    _cross_val_metric's docstring). This function ALWAYS retrains on the
+    complete current transaction history every time it's called (never an
+    incremental/partial update on top of a stale prior model) -- for a
+    dataset this size that is the statistically correct choice, not a
+    limitation: a fresh batch fit on all available labeled data outperforms
+    incremental updates, and it means "new transaction arrives" -> "next
+    retrain sees 100% of history, including that transaction" always, with
+    no risk of silently drifting from what's actually in the database. What
+    IS cached across restarts is the trained bundle itself (see
+    save_model_state/load_model_state) so a process restart doesn't sit
+    untrained while waiting for the next retrain -- not the training
+    process."""
     history_index = build_applicant_history_index(transactions)
     feats = [extract_features(t, history_index) for t in transactions]
     for f, t in zip(feats, transactions):
         f["_is_bank_rfi"] = bool(t.get("is_bank_rfi"))
         f["_is_open"] = t.get("review_status") in OPEN_STATUSES
+        # Used only by _temporal_holdout_metrics to build a chronological
+        # train/test split -- never fed into the feature vector itself.
+        f["_created_at"] = _parse_dt(t)
 
     bank_rfi_feats = [f for f in feats if f["_is_bank_rfi"]]
     confirmed_other_feats = [f for f in feats if not f["_is_bank_rfi"] and not f["_is_open"]]
@@ -1107,6 +1307,14 @@ def train_model(transactions: list[dict]) -> ModelBundle:
         "n_bank_rfi": len(bank_rfi_feats),
         "n_confirmed_other": len(confirmed_other_feats),
         "n_excluded_open_pending": len(excluded_open_feats),
+        "positive_rate_pct_in_training": (
+            round(100 * len(bank_rfi_feats) / len(labeled_feats), 2) if labeled_feats else None
+        ),
+        "rare_event_note": (
+            "Bank-rfi is treated as a rare/imbalanced event: class_weight=\"balanced\" reweights training, "
+            "StratifiedKFold preserves the true ratio in every fold, and both ROC-AUC and PR-AUC (more "
+            "informative under imbalance) are tracked."
+        ),
     }
 
     if len(bank_rfi_feats) < MIN_ML_SAMPLES or len(confirmed_other_feats) < MIN_ML_SAMPLES:
@@ -1143,9 +1351,10 @@ def train_model(transactions: list[dict]) -> ModelBundle:
         clf = CalibratedClassifierCV(base_clf, method="sigmoid", cv=cv_folds)
         clf.fit(X_labeled, y)
 
-        cv_auc = _cv_roc_auc(
-            lambda: LogisticRegression(max_iter=3000, class_weight="balanced", C=0.3), X_labeled, y, cv_folds,
-        )
+        clf_factory = lambda: LogisticRegression(max_iter=3000, class_weight="balanced", C=0.3)  # noqa: E731
+        cv_auc = _cross_val_metric(clf_factory, X_labeled, y, cv_folds, scoring="roc_auc")
+        cv_pr_auc = _cross_val_metric(clf_factory, X_labeled, y, cv_folds, scoring="average_precision")
+        temporal_metrics = _temporal_holdout_metrics(labeled_feats, vocab)
 
         rfi_matrix = _vectorize(bank_rfi_feats, vocab, scaler)
         bundle = ModelBundle(
@@ -1161,6 +1370,14 @@ def train_model(transactions: list[dict]) -> ModelBundle:
                     "confirmed-other transactions. Computed with fresh cross-validation folds, not on data "
                     "the final model was fit on."
                 ),
+                "cv_pr_auc": cv_pr_auc,
+                "cv_pr_auc_note": (
+                    "Precision-recall AUC over the same folds -- higher weight on correctly finding the "
+                    "rare bank-rfi positives specifically, less forgiving than ROC-AUC of a model that "
+                    "mostly just predicts \"not bank-rfi\". 1.0 = perfect; a useful floor to compare "
+                    "against is the positive rate in training (see positive_rate_pct_in_training)."
+                ),
+                **temporal_metrics,
             },
         )
 
@@ -1814,9 +2031,14 @@ def retrain_only():
                 metrics={"n_training_rows": len(txns), **_current_bundle.metrics},
                 feature_importances=_feature_importances(_current_bundle),
             )
+            # Cache the freshly-trained bundle so a process restart before
+            # the NEXT retrain can resume from here instead of sitting
+            # untrained (see save_model_state/load_model_state).
+            save_model_state(_current_bundle, len(txns))
             logger.info(
-                "Retrained model in %s mode on %d transactions (cv_roc_auc=%s)",
+                "Retrained model in %s mode on %d transactions (cv_roc_auc=%s, cv_pr_auc=%s)",
                 _current_bundle.mode, len(txns), _current_bundle.metrics.get("cv_roc_auc"),
+                _current_bundle.metrics.get("cv_pr_auc"),
             )
             # Persist a snapshot of every currently-scored candidate so
             # "every newly predicted transaction" leaves a durable record
@@ -1856,8 +2078,21 @@ def run_ingest_and_retrain():
 
 
 def _ensure_bundle_loaded():
+    """Called on startup (and lazily by any endpoint that needs a model
+    before the scheduler's first run completes). Tries the cached, already-
+    trained bundle FIRST -- see load_model_state -- so the dashboard shows
+    a working model within milliseconds of the process starting instead of
+    "untrained" while a full retrain (or worse, a full re-backfill from
+    Sumsub after an ephemeral-disk wipe) runs in the background. The normal
+    retrain_only() path (webhook-driven or the safety-net scheduler) still
+    runs exactly as before and will overwrite this with a fully current
+    model the moment new data justifies it -- this only fills the gap
+    between process start and that first retrain."""
     global _current_bundle
     if _current_bundle is None:
+        _current_bundle = load_model_state()
+        if _current_bundle is not None:
+            return
         txns = all_transactions()
         if txns:
             _current_bundle = train_model(txns)
@@ -2007,6 +2242,11 @@ def api_summary():
         "model_mode": latest_version["mode"] if latest_version else "untrained",
         "model_trained_at": latest_version["trained_at"] if latest_version else None,
         "model_cv_roc_auc": metrics.get("cv_roc_auc"),
+        "model_cv_pr_auc": metrics.get("cv_pr_auc"),
+        "model_temporal_holdout_roc_auc": metrics.get("temporal_holdout_roc_auc"),
+        "model_temporal_holdout_pr_auc": metrics.get("temporal_holdout_pr_auc"),
+        "model_temporal_holdout_note": metrics.get("temporal_holdout_note"),
+        "model_positive_rate_pct": metrics.get("positive_rate_pct_in_training"),
         "model_n_confirmed_other": metrics.get("n_confirmed_other"),
         "model_n_excluded_open_pending": metrics.get("n_excluded_open_pending"),
         "model_heuristic_reason": metrics.get("reason"),
@@ -2530,7 +2770,7 @@ FRONTEND_HTML = r"""<!doctype html>
       <div class="details-body">
         <p class="desc">Every retrain is logged for audit purposes &mdash; this is a compliance tool, so nothing here is a black box.</p>
         <table id="historyTable">
-          <thead><tr><th>Trained at</th><th>Mode</th><th>Bank-rfi examples</th><th>Confirmed-other examples</th><th>Excluded (open/pending)</th><th>CV ROC-AUC</th></tr></thead>
+          <thead><tr><th>Trained at</th><th>Mode</th><th>Bank-rfi examples</th><th>Confirmed-other examples</th><th>Excluded (open/pending)</th><th>CV ROC-AUC</th><th>CV PR-AUC</th><th>Temporal holdout AUC</th></tr></thead>
           <tbody id="historyBody"></tbody>
         </table>
       </div>
@@ -2679,8 +2919,12 @@ function renderRecentWebhooks(events) {
 
 function renderTiles(s) {
   const aucVal = (typeof s.model_cv_roc_auc === "number") ? s.model_cv_roc_auc.toFixed(3) : "–";
+  const prVal = (typeof s.model_cv_pr_auc === "number") ? s.model_cv_pr_auc.toFixed(3) : "–";
+  const holdoutVal = (typeof s.model_temporal_holdout_roc_auc === "number") ? s.model_temporal_holdout_roc_auc.toFixed(3) : null;
   const modeSub = s.model_mode === "ml"
-    ? (typeof s.model_cv_roc_auc === "number" ? `cross-validated AUC ${aucVal} (0.5=random, 1.0=perfect)` : "trained " + (s.model_trained_at||""))
+    ? (typeof s.model_cv_roc_auc === "number"
+        ? `CV ROC-AUC ${aucVal} · PR-AUC ${prVal}` + (holdoutVal ? ` · temporal holdout AUC ${holdoutVal}` : "") + ` (${s.model_positive_rate_pct != null ? s.model_positive_rate_pct + "% positive" : "rare-event"})`
+        : "trained " + (s.model_trained_at||""))
     : (s.model_heuristic_reason || (s.model_trained_at ? ("trained " + s.model_trained_at) : "not trained yet"));
   const tiles = [
     {label: "Transactions scanned", value: fmt(s.total_transactions)},
@@ -2775,8 +3019,12 @@ function renderHistory(versions) {
   body.innerHTML = versions.length ? versions.map(v => {
     const m = v.metrics_json || {};
     const auc = (typeof m.cv_roc_auc === "number") ? m.cv_roc_auc.toFixed(3) : (v.mode === "ml" ? "–" : "n/a (heuristic)");
-    return `<tr><td>${v.trained_at}</td><td>${v.mode}</td><td>${v.n_bank_rfi}</td><td>${v.n_other}</td><td>${fmt(m.n_excluded_open_pending)}</td><td>${auc}</td></tr>`;
-  }).join("") : '<tr><td colspan="6" class="empty">No trained model versions yet.</td></tr>';
+    const prAuc = (typeof m.cv_pr_auc === "number") ? m.cv_pr_auc.toFixed(3) : (v.mode === "ml" ? "–" : "n/a (heuristic)");
+    const holdout = (typeof m.temporal_holdout_roc_auc === "number")
+      ? m.temporal_holdout_roc_auc.toFixed(3) + ` (n=${fmt(m.temporal_holdout_n_test)})`
+      : (m.temporal_holdout_note ? "not enough data yet" : "–");
+    return `<tr><td>${v.trained_at}</td><td>${v.mode}</td><td>${v.n_bank_rfi}</td><td>${v.n_other}</td><td>${fmt(m.n_excluded_open_pending)}</td><td>${auc}</td><td>${prAuc}</td><td title="${(m.temporal_holdout_note||"").replace(/"/g,'&quot;')}">${holdout}</td></tr>`;
+  }).join("") : '<tr><td colspan="8" class="empty">No trained model versions yet.</td></tr>';
 }
 
 document.getElementById("refreshBtn").addEventListener("click", async (e) => {
