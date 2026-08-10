@@ -749,11 +749,39 @@ CATEGORICAL_FEATURES = ["currency", "txn_type", "counterparty_country"]
 MAX_CATEGORICAL_VOCAB = 12
 NUMERIC_FEATURES = [
     "amount", "log_amount", "direction_out", "counterparty_high_risk", "is_round_amount",
-    "near_reporting_threshold", "applicant_prior_txn_count", "applicant_prior_bank_rfi_count",
-    "applicant_prior_bank_rfi_rate", "applicant_txn_count_24h", "applicant_txn_count_7d",
-    "applicant_avg_prior_amount", "amount_vs_applicant_avg", "hour_of_day", "is_weekend",
-    "is_new_applicant",
+    "near_reporting_threshold", "applicant_prior_txn_count", "applicant_txn_count_24h",
+    "applicant_txn_count_7d", "applicant_avg_prior_amount", "amount_vs_applicant_avg",
+    "hour_of_day", "is_weekend", "is_new_applicant",
 ]
+
+# ----------------------------------------------------------------------------
+# ANTI-LEAKAGE GUARANTEE (do not weaken this without re-reading the incident
+# this fixed): the "bank rfi" tag -- and anything counted/derived from it,
+# such as how many times an applicant's PAST transactions were tagged -- must
+# never appear in NUMERIC_FEATURES or CATEGORICAL_FEATURES. Those two lists
+# are the entire input (X) the classifier/heuristic ever sees. is_bank_rfi is
+# the *label* (y) in train_model -- ground truth to learn FROM and to
+# evaluate against, never a variable the model reads to make a live
+# prediction. An earlier version violated this: it fed
+# "applicant_prior_bank_rfi_count"/"applicant_prior_bank_rfi_rate" into the
+# feature vector AND surfaced "this applicant already has an X% bank-rfi
+# rate" as a scoring justification. That let the bot shortcut to "flag it
+# because it (or this applicant) was already flagged before" instead of
+# learning the actual behavioral patterns (amount, timing, velocity,
+# counterparty risk, structuring) that make a transaction look like a bank
+# RFI in the first place -- which also meant a first-time applicant with a
+# risky profile but no tag history could never score high. Fixed by removing
+# both the features and the reason string, and this comment + the assertion
+# right below exist so a future change can't silently reintroduce it.
+_FORBIDDEN_FEATURE_MARKERS = ("bank_rfi", "is_rfi", "_tag")
+for _fname in NUMERIC_FEATURES + CATEGORICAL_FEATURES:
+    if any(marker in _fname for marker in _FORBIDDEN_FEATURE_MARKERS):
+        raise RuntimeError(
+            f"Anti-leakage guard tripped: feature '{_fname}' looks derived from the bank-rfi tag "
+            "itself and must not be used as a model input. See the comment above NUMERIC_FEATURES."
+        )
+del _fname
+# ----------------------------------------------------------------------------
 
 
 def _parse_amount(row: dict) -> float:
@@ -821,7 +849,11 @@ def extract_features(row: dict, history_index: dict) -> dict:
 
     prior = [t for t in history if t.get("txn_id") != row.get("txn_id") and (_parse_dt(t) or datetime.min) <= (dt or datetime.max)]
     prior_amounts = [_parse_amount(t) for t in prior]
-    prior_bank_rfi = sum(1 for t in prior if t.get("is_bank_rfi"))
+    # Deliberately NOT computing/returning anything derived from prior
+    # is_bank_rfi tags here (e.g. a prior bank-rfi count/rate) -- see the
+    # anti-leakage comment above NUMERIC_FEATURES. This function's output is
+    # the model's entire view of a transaction; it must describe behavior
+    # (amounts, timing, velocity, counterparty) only, never tag history.
 
     window_24h = [t for t in prior if dt and _parse_dt(t) and (dt - _parse_dt(t)).total_seconds() <= 86400]
     window_7d = [t for t in prior if dt and _parse_dt(t) and (dt - _parse_dt(t)).total_seconds() <= 7 * 86400]
@@ -843,8 +875,6 @@ def extract_features(row: dict, history_index: dict) -> dict:
         "near_reporting_threshold": 1 if just_under_threshold else 0,
         "nearest_threshold_gap": nearest_threshold_gap,
         "applicant_prior_txn_count": len(prior),
-        "applicant_prior_bank_rfi_count": prior_bank_rfi,
-        "applicant_prior_bank_rfi_rate": (prior_bank_rfi / len(prior)) if prior else 0.0,
         "applicant_txn_count_24h": len(window_24h),
         "applicant_txn_count_7d": len(window_7d),
         "applicant_avg_prior_amount": statistics.fmean(prior_amounts) if prior_amounts else 0.0,
@@ -1181,10 +1211,11 @@ def _matched_reasons(feat: dict, pattern_findings: dict) -> list[str]:
         reasons.append("Counterparty country is on the elevated-risk list.")
     if feat.get("near_reporting_threshold"):
         reasons.append("Amount sits just under a common reporting/monitoring threshold.")
-    if feat.get("applicant_prior_bank_rfi_rate", 0) > 0:
-        reasons.append(
-            f"This applicant already has a {feat['applicant_prior_bank_rfi_rate']*100:.0f}% bank-rfi rate on prior transactions."
-        )
+    # No "this applicant was already tagged before" reason here on purpose --
+    # that would be citing the bank-rfi tag itself as justification, which is
+    # exactly the leakage this file guards against (see the comment above
+    # NUMERIC_FEATURES). Every reason surfaced must trace back to a
+    # behavioral feature, not tag history.
     return reasons
 
 
