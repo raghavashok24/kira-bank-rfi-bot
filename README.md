@@ -12,7 +12,25 @@ retrains the instant a webhook event comes in from Sumsub, so the risk
 picture stays current within seconds of something changing on your account,
 not on a schedule.
 
-## What it does
+## Contents
+
+- [What it actually does](#what-it-actually-does)
+- [Repo layout](#repo-layout)
+- [Quick start](#quick-start)
+- [Credentials](#credentials)
+- [How data gets in](#how-data-gets-in)
+- [How the model works](#how-the-model-works)
+- [The dashboard](#the-dashboard)
+- [Deploying on Render](#deploying-on-render)
+- [Environment variables reference](#environment-variables-reference)
+- [Running it locally](#running-it-locally)
+- [Trying it before real Sumsub data is connected](#trying-it-before-real-sumsub-data-is-connected)
+- [Securing the webhook](#securing-the-webhook)
+- [Security notes](#security-notes)
+- [API reference](#api-reference)
+- [Troubleshooting](#troubleshooting)
+
+## What it actually does
 
 Every transaction the bot ever learns from was fetched from the real Sumsub
 API — there is no seed file, no manual list, and no synthetic data in the
@@ -300,6 +318,20 @@ the model instead learns which *behaviors* — not which tag history — the
 confirmed "bank rfi" examples have in common, then applies that purely to
 each new transaction's own behavior in real time.
 
+*To verify this yourself*: `transactions_since_last_bank_rfi()` — the
+function that decides which rows are even eligible to be scored — only
+ever returns rows that do NOT carry the tag (by definition, a tagged
+transaction has already resolved, it's not a candidate anymore). Combined
+with the assertion above, a candidate being scored can never have had its
+own tag read as an input, because it doesn't have one yet, and even the
+historical tag counts that used to leak in are gone. The one place the
+tag legitimately still shows up in a prediction response is
+`similar_bank_rfi_transactions` — a *reference list* of past confirmed
+cases shown for a human reviewer's benefit (per the original "justification
+and references to supporting past transactions" requirement), computed by
+comparing behavioral feature similarity, not used to compute `risk_score`
+itself.
+
 **Every prediction is logged, not just computed and discarded.** After
 every retrain, the current score for every open candidate is written to a
 `predictions_log` table (skipping a re-write if a transaction's score
@@ -367,6 +399,12 @@ instead of requiring a support back-and-forth:
 - **Model & ingestion history** — every retrain logged with its mode,
   example counts (including how many were excluded as still-open/pending),
   and cross-validated AUC, for audit purposes.
+- **Predicted candidates table** — each row shows the transaction's own
+  date (`Txn date`, from Sumsub) alongside `Added to bot` (when this app
+  itself first ingested the row), so it's immediately visible whether a
+  candidate is something that just happened or an older transaction that
+  only recently got backfilled — both are sortable columns like every
+  other one in the table.
 
 ## Deploying on Render
 
@@ -402,6 +440,36 @@ happening and why. If persistence across restarts matters, add a **Disk**
 panel also flags whether your current `BOT_DB_PATH` looks ephemeral
 (`db_likely_ephemeral` in `GET /api/setup`).
 
+### Verifying a deploy actually worked
+
+After pushing these files and setting the environment variables, confirm
+it's really working rather than assuming it from a green Render deploy
+(a deploy can succeed while the app itself fails at startup — see the
+first two entries in [Troubleshooting](#troubleshooting) for exactly that
+failure mode, now fixed):
+
+1. Open `https://<your-render-url>/api/health` directly — it should
+   return `{"status": "ok", ...}` immediately. If this doesn't load at
+   all, the app itself isn't running; check Render's deploy/runtime logs
+   for a traceback.
+2. Open the dashboard root URL. The "Model mode" tile should show
+   `heuristic` or `ml`, not sit on "untrained" for more than a few
+   seconds after a fresh deploy with existing data.
+3. If `SLACK_BOT_TOKEN`/`SLACK_CHANNEL` are set, you should see a
+   "Bank RFI Prediction Bot started" message in the configured channel
+   within a few seconds of the deploy finishing — this alone confirms the
+   process booted, credentials are present, and Slack itself is reachable,
+   without needing to look at Render at all.
+4. Check the Setup panel on the dashboard (or `GET /api/setup`) for any
+   critical (red) or warning (yellow) rows — it's designed to name the
+   exact problem (missing credentials, webhook not registered, signature
+   mismatch, no confirmed-clean examples yet) rather than leave you
+   guessing from a blank dashboard.
+5. Send a test webhook from Sumsub's Webhook manager, or wait for a real
+   transaction event, then check "Recent webhook activity" on the
+   dashboard — it should show the event with a successful signature check
+   and `Ingested? ✓`.
+
 ### Environment variables reference
 
 | Variable | Required? | Default | Purpose |
@@ -414,6 +482,42 @@ panel also flags whether your current `BOT_DB_PATH` looks ephemeral
 | `MIN_ML_SAMPLES` | No | `15` | Confirmed examples needed (of *both* classes) before switching from the transparent rule-based score to calibrated ML |
 | `SUMSUB_BASE_URL` | No | `https://api.sumsub.com` | Override for sandbox/alternate environments |
 | `BANK_RFI_TAG` | No | `bank rfi` | The tag string the bot watches for (matching is already case/separator-insensitive — see [The dashboard](#the-dashboard)) |
+| `SLACK_BOT_TOKEN` | No | — (Slack off) | Bot token (`xoxb-...`) from a Slack app with the `chat:write` scope, installed to your workspace. See [Slack notifications](#slack-notifications). |
+| `SLACK_CHANNEL` | No | — (Slack off) | Channel ID or name (e.g. `#kyt-alerts`) the bot has been invited to. Both this and `SLACK_BOT_TOKEN` must be set for notifications to turn on. |
+| `SLACK_HIGH_RISK_THRESHOLD` | No | `0.75` | Risk score (0–1) at/above which a newly-changed prediction posts a Slack alert. |
+
+### Slack notifications
+
+Entirely optional and off by default — set both `SLACK_BOT_TOKEN` and
+`SLACK_CHANNEL` in Render's Environment tab to turn it on, nothing else to
+configure. Three things post to the channel:
+
+1. **On every process start** — a status message with how many
+   transactions are in the database, the current model mode, whether
+   Sumsub credentials are configured, and whether webhook signature
+   verification is on. This doubles as a live "yes, this is actually
+   running" signal independent of opening Render's dashboard or logs —
+   useful given Render's free tier restarts the process on every redeploy
+   and after periods of inactivity.
+2. **The moment a transaction is actually confirmed `"bank rfi"` on
+   Sumsub** (ground truth, not a prediction) — one message per
+   transaction, not one per webhook event about it (a transaction that
+   goes through created → reviewed → approved only triggers this once,
+   the first time it's actually tagged).
+3. **Whenever a candidate newly crosses `SLACK_HIGH_RISK_THRESHOLD`**
+   (default 75%) predicted risk — checked after every retrain, but only
+   for transactions whose score is new or has materially changed since
+   the last retrain (the same dedup `predictions_log` already uses), so
+   this can't spam the channel with the same steady-state high scores
+   over and over. Multiple newly-high-risk transactions from the same
+   retrain are batched into a single message, sorted by score, capped at
+   the top 10 with a count of any more.
+
+A Slack outage, a bad token, or the variables simply not being set yet can
+never break ingestion, training, or the webhook response path — every
+Slack call is wrapped so a failure there is logged and swallowed, never
+raised. Check `GET /api/setup`'s `slack_configured` field, or the Setup
+panel on the dashboard, to confirm it's actually on.
 
 ## Running it locally
 
@@ -519,6 +623,32 @@ the public URL.
   [Securing the webhook](#securing-the-webhook))
 
 ## Troubleshooting
+
+**The whole app seemed to stop responding / "the model doesn't work at
+all" after a deploy.** This was a real bug, now fixed: the startup
+sequence (loading a cached model, starting the background scheduler,
+checking for an empty database, sending the optional Slack startup
+message) previously had no error isolation between those steps — if
+*any one* of them raised an exception (a corrupted cached model, a
+transient network error checking Sumsub, anything), FastAPI/Uvicorn would
+fail to start the entire application, meaning literally nothing
+responded, not even the dashboard or `/api/health`. Every one of those
+steps is now independently wrapped, so a problem in one (logged, not
+silent) can never prevent the others — or the app itself — from coming
+up. If you're on a version from before this fix and see the app
+completely unresponsive after a deploy, check Render's deploy logs for a
+traceback right after "Starting..." — that's almost certainly this.
+
+**The dashboard's "Model mode" tile said "untrained" right after a
+restart, even though predictions were showing up in the table below
+it.** Also a real, now-fixed bug: that tile used to be sourced from a
+database table (`model_versions`) that's only written the moment an
+actual retrain runs — but the model that gets *restored from cache* (or
+trained fresh) on process startup could populate a perfectly working
+model in memory without ever writing that row, so the tile could lag
+reality by up to a full `INGEST_INTERVAL_MINUTES` after every restart.
+The tile now reads the live in-memory model directly, so it's accurate
+immediately.
 
 **The "tagged bank rfi" count dropped to 0 after a deploy.** Almost always
 the ephemeral-storage issue described in
