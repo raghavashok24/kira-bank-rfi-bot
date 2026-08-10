@@ -89,6 +89,7 @@ import os
 import re
 import sqlite3
 import statistics
+import threading
 import time
 import urllib.parse
 from collections import Counter, defaultdict
@@ -106,6 +107,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from scipy import stats as scipy_stats
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.preprocessing import StandardScaler
 
 load_dotenv()
@@ -127,55 +129,39 @@ MIN_ML_SAMPLES = int(os.environ.get("MIN_ML_SAMPLES", "15"))
 INGEST_INTERVAL_MINUTES = int(os.environ.get("INGEST_INTERVAL_MINUTES", "60"))  # safety-net backfill sweep only -- real retraining is event-driven via the webhook, see retrain_only()
 CONNECTION_CHECK_CACHE_SECONDS = 60
 
-# Slack alerting -- optional, three ways to deliver, tried in this order:
-#   1. Slack Web API with a ROTATING (expiring) token pair -- used if
-#      SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_ACCESS_TOKEN, and
-#      SLACK_REFRESH_TOKEN are all set. This is what a Slack app with "Token
-#      Rotation" enabled issues: an access token (starts xoxe.xoxb-... for a
-#      bot, or xoxe.xoxp-... for a user) that expires in ~12 hours, paired
-#      with a refresh token (starts xoxe-1-...) used to mint a new pair
-#      before that happens. SLACK_CLIENT_ID/SLACK_CLIENT_SECRET come from
-#      the Slack app's Basic Information page ("App Credentials") -- both
-#      are required to call the refresh endpoint (oauth.v2.access).
-#      SLACK_ACCESS_TOKEN/SLACK_REFRESH_TOKEN are only the STARTING pair --
-#      see _get_valid_slack_access_token for how the bot keeps itself
-#      current after that (persisted in the slack_oauth_state table, since
-#      Slack invalidates each refresh token the moment it's used and issues
-#      a new one, so the original env var values stop working after the
-#      first automatic refresh).
-#   2. Slack Web API with a STATIC (non-expiring) bot token -- used if
-#      SLACK_BOT_TOKEN AND SLACK_CHANNEL are set (and option 1 isn't
-#      configured). This is the classic Bot User OAuth Token from OAuth &
-#      Permissions -> Bot Token Scopes (starts xoxb-...) -- no refresh
-#      logic needed, simpler if your app doesn't have Token Rotation on.
-#   3. Incoming Webhook -- used if SLACK_WEBHOOK_URL is set (and neither
-#      API option above is configured). Simplest: one URL, tied to one
-#      pre-chosen channel, no app/bot/scopes/tokens to manage at all.
-# If NONE of the above is configured, alerting is a silent no-op everywhere
-# it's called (see send_slack_alert). When one is configured, every open
-# transaction whose predicted risk score crosses SLACK_ALERT_THRESHOLD gets
-# posted exactly once (tracked via the transactions.slack_alerted flag),
-# right after every retrain -- both the webhook-triggered one and the
-# hourly safety-net one.
-SLACK_CLIENT_ID = os.environ.get("SLACK_CLIENT_ID", "")
-SLACK_CLIENT_SECRET = os.environ.get("SLACK_CLIENT_SECRET", "")
-SLACK_ACCESS_TOKEN = os.environ.get("SLACK_ACCESS_TOKEN", "")   # starting rotating access token (xoxe.xoxb-... / xoxe.xoxp-...)
-SLACK_REFRESH_TOKEN = os.environ.get("SLACK_REFRESH_TOKEN", "")  # starting refresh token (xoxe-1-...)
-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")          # classic, non-expiring bot token (xoxb-...), alternative to the rotating pair above
-SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")              # e.g. "#potential-bank-rfi-alerts" or a channel ID like "C0123456789"
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-SLACK_ALERT_THRESHOLD = float(os.environ.get("SLACK_ALERT_THRESHOLD", "0.7"))
-SLACK_TOKEN_REFRESH_BUFFER_SECONDS = 300  # refresh this many seconds before actual expiry, not right at the deadline
+# Optional, but strongly recommended: the secret key shown in Sumsub
+# Dashboard -> Webhook manager when you create/edit a webhook (auto-
+# generated, or one you set yourself). Same rule as SUMSUB_APP_TOKEN /
+# SUMSUB_SECRET_KEY -- put it in Render's Environment tab, never in chat,
+# a ticket, or committed code. Without this set, ANY POST to
+# /api/webhooks/sumsub is accepted at face value (no way to tell a real
+# Sumsub event from someone else hitting the public URL) -- see
+# verify_webhook_signature and docs.sumsub.com/docs/webhook-manager.
+SUMSUB_WEBHOOK_SECRET_KEY = os.environ.get("SUMSUB_WEBHOOK_SECRET_KEY", "")
+# Maps the algorithm name Sumsub sends in the X-Payload-Digest-Alg header to
+# the matching hashlib constructor. HMAC_SHA1_HEX is Sumsub's legacy/
+# deprecated option -- supported here for compatibility with older webhook
+# configs, but HMAC_SHA256_HEX (the default for new webhooks) or
+# HMAC_SHA512_HEX should be preferred.
+WEBHOOK_DIGEST_ALGOS = {
+    "HMAC_SHA256_HEX": hashlib.sha256,
+    "HMAC_SHA512_HEX": hashlib.sha512,
+    "HMAC_SHA1_HEX": hashlib.sha1,
+}
 
 
 def _normalize_tag(text: str) -> str:
-    """Case-insensitive, whitespace-collapsed tag comparison key -- so a tag
-    stored on Sumsub as "Bank RFI", " bank  rfi ", or "BANK RFI" all still
-    match BANK_RFI_TAG. This is the ONLY thing that decides whether a fetched
-    transaction counts as "bank rfi" -- every transaction the bot pulls in
-    (via webhook or the manual ID import) is checked against this, and it's
-    an exact match on the tag's label text, not a fuzzy/partial one."""
-    return re.sub(r"\s+", " ", (text or "").strip().lower())
+    """Case-insensitive, separator-insensitive tag comparison key -- so a tag
+    stored on Sumsub as "Bank RFI", " bank  rfi ", "BANK RFI", "bank-rfi", or
+    "bank_rfi" all still match BANK_RFI_TAG. This is the ONLY thing that
+    decides whether a fetched transaction counts as "bank rfi" -- every
+    transaction the bot pulls in (via webhook or the manual ID import) is
+    checked against this. Hyphens/underscores are folded to spaces (in
+    addition to whitespace collapsing) because Sumsub tag labels are
+    sometimes typed with different separators by different reviewers, and a
+    label that reads identically to a human should still match here."""
+    normalized = re.sub(r"[\s_-]+", " ", (text or "").strip().lower())
+    return normalized.strip()
 
 
 BANK_RFI_TAG_NORMALIZED = _normalize_tag(BANK_RFI_TAG)
@@ -331,7 +317,6 @@ CREATE TABLE IF NOT EXISTS transactions (
     notes TEXT,
     notes_text TEXT,
     is_bank_rfi INTEGER DEFAULT 0,
-    slack_alerted INTEGER DEFAULT 0,
     raw_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_txn_applicant ON transactions(applicant_id);
@@ -352,23 +337,17 @@ CREATE TABLE IF NOT EXISTS model_versions (
 CREATE TABLE IF NOT EXISTS webhook_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     received_at TEXT DEFAULT CURRENT_TIMESTAMP, event_type TEXT, kyt_txn_id TEXT,
-    raw_json TEXT, processed INTEGER DEFAULT 0
-);
-
--- Single-row table (id is always 1) holding the CURRENT Slack rotating
--- access/refresh token pair, once the bot has refreshed at least once.
--- Needed because Slack invalidates a refresh token the instant it's used
--- and issues a brand-new one -- the SLACK_REFRESH_TOKEN env var is only the
--- STARTING value; after the first automatic refresh, the live token pair
--- lives here instead (see _get_valid_slack_access_token).
-CREATE TABLE IF NOT EXISTS slack_oauth_state (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    access_token TEXT,
-    refresh_token TEXT,
-    expires_at TEXT
+    raw_json TEXT, processed INTEGER DEFAULT 0, process_detail TEXT
 );
 """
 
+# Sumsub's documented reviewStatus values (docs.sumsub.com/docs/transaction-
+# monitoring-webhooks) are "init", "onHold", "awaitingUser", "completed" --
+# only "completed" means a transaction has a final, trustworthy verdict.
+# "pending"/"queued"/None/"" are kept too as a defensive catch-all for any
+# undocumented/legacy value actually observed on the wire, so an unexpected
+# status fails safe (treated as "still open", i.e. excluded from training
+# rather than silently trusted as a confirmed negative).
 OPEN_STATUSES = ("init", "onHold", "awaitingUser", "pending", "queued", None, "")
 
 
@@ -379,8 +358,9 @@ def init_db():
         for new_col in ("notes", "notes_text", "counterparty_bank_name"):
             if new_col not in cols:
                 conn.execute(f"ALTER TABLE transactions ADD COLUMN {new_col} TEXT")
-        if "slack_alerted" not in cols:
-            conn.execute("ALTER TABLE transactions ADD COLUMN slack_alerted INTEGER DEFAULT 0")
+        wh_cols = {r["name"] for r in conn.execute("PRAGMA table_info(webhook_events)").fetchall()}
+        if "process_detail" not in wh_cols:
+            conn.execute("ALTER TABLE webhook_events ADD COLUMN process_detail TEXT")
 
 
 @contextmanager
@@ -418,13 +398,38 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     d["notes"] = json.loads(d.get("notes") or "[]")
     d["raw_json"] = json.loads(d.get("raw_json") or "{}")
     d["is_bank_rfi"] = bool(d.get("is_bank_rfi"))
-    d["slack_alerted"] = bool(d.get("slack_alerted"))
     return d
 
 
 def all_transactions() -> list[dict]:
     with get_conn() as conn:
         return [_row_to_dict(r) for r in conn.execute("SELECT * FROM transactions").fetchall()]
+
+
+def distinct_raw_tags(transactions: list[dict] | None = None) -> list[dict]:
+    """Every distinct raw tag label actually seen across ingested
+    transactions, with how many transactions carry it and whether it's the
+    one this bot is matching against (BANK_RFI_TAG_NORMALIZED). This exists
+    purely as a diagnostic: if the count of bank-rfi transactions is ever
+    unexpectedly 0/low despite real tagged transactions existing on Sumsub,
+    this list makes a spelling/separator mismatch (e.g. "bank-rfi" vs
+    "bank rfi", or a totally different label) visible immediately instead of
+    requiring someone to manually pull one transaction's tags via the API to
+    check."""
+    txns = transactions if transactions is not None else all_transactions()
+    counts: dict[str, int] = {}
+    for t in txns:
+        for tag in (t.get("tags") or []):
+            tag = (tag or "").strip()
+            if not tag:
+                continue
+            counts[tag] = counts.get(tag, 0) + 1
+    out = [
+        {"tag": tag, "count": count, "matches_bank_rfi": _normalize_tag(tag) == BANK_RFI_TAG_NORMALIZED}
+        for tag, count in counts.items()
+    ]
+    out.sort(key=lambda r: (-r["count"], r["tag"]))
+    return out
 
 
 def open_transactions() -> list[dict]:
@@ -481,32 +486,6 @@ def get_transaction(txn_id: str) -> dict | None:
         return _row_to_dict(row) if row else None
 
 
-def mark_slack_alerted(txn_id: str):
-    """Flip the one-time flag so a transaction that already triggered a
-    Slack alert doesn't trigger another one on the next retrain (hourly
-    safety-net job, or every webhook event) just because it's still sitting
-    above the risk threshold."""
-    with get_conn() as conn:
-        conn.execute("UPDATE transactions SET slack_alerted=1 WHERE txn_id=?", (txn_id,))
-
-
-def load_slack_oauth_state() -> dict | None:
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM slack_oauth_state WHERE id=1").fetchone()
-        return dict(row) if row else None
-
-
-def save_slack_oauth_state(access_token: str, refresh_token: str, expires_at: datetime):
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO slack_oauth_state (id, access_token, refresh_token, expires_at)
-               VALUES (1, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET access_token=excluded.access_token,
-                   refresh_token=excluded.refresh_token, expires_at=excluded.expires_at""",
-            (access_token, refresh_token, expires_at.isoformat()),
-        )
-
-
 def record_ingestion_run(started_at, finished_at, strategy_used, scanned_count, new_bank_rfi_count, notes=""):
     with get_conn() as conn:
         total = conn.execute("SELECT COUNT(*) c FROM transactions WHERE is_bank_rfi=1").fetchone()["c"]
@@ -559,17 +538,58 @@ def model_version_history(limit=50) -> list[dict]:
         return out
 
 
-def record_webhook_event(event_type: str, kyt_txn_id: str, raw_json: dict):
+def record_webhook_event(event_type: str, kyt_txn_id: str, raw_json: dict) -> int:
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO webhook_events (event_type, kyt_txn_id, raw_json) VALUES (?,?,?)",
             (event_type, kyt_txn_id, json.dumps(raw_json)),
         )
+        return cur.lastrowid
 
 
-def webhook_event_count() -> int:
+def mark_webhook_event_processed(row_id: int, ok: bool, detail: str = ""):
     with get_conn() as conn:
+        conn.execute(
+            "UPDATE webhook_events SET processed=?, process_detail=? WHERE id=?",
+            (1 if ok else 0, detail, row_id),
+        )
+
+
+def webhook_event_count(exclude_invalid_signature: bool = True) -> int:
+    with get_conn() as conn:
+        if exclude_invalid_signature:
+            return conn.execute(
+                "SELECT COUNT(*) c FROM webhook_events WHERE event_type != 'invalid_signature'"
+            ).fetchone()["c"]
         return conn.execute("SELECT COUNT(*) c FROM webhook_events").fetchone()["c"]
+
+
+def webhook_event_type_breakdown(hours: int = 24 * 14) -> list[dict]:
+    """Every distinct Sumsub event `type` actually received in the last
+    `hours`, with counts and how many of each resulted in a real
+    ingest-and-retrain. This is THE diagnostic for "the webhook isn't firing
+    for every new transaction" -- Sumsub only sends event types you've
+    explicitly enabled in Dashboard -> Webhook manager (see
+    docs.sumsub.com/docs/transaction-monitoring-webhooks), and the event
+    that fires when a transaction is FIRST created is a specific type
+    (applicantKytTxnCreated) distinct from review-outcome events like
+    applicantKytTxnApproved/Rejected/Reviewed. If that type never appears
+    here, new transactions aren't reaching this bot in real time no matter
+    how correct the code is -- the fix is enabling it on Sumsub's side, not
+    a code change."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT event_type, COUNT(*) c, SUM(processed) processed_c FROM webhook_events "
+            "WHERE received_at >= ? GROUP BY event_type ORDER BY c DESC",
+            (cutoff,),
+        ).fetchall()
+        return [{"event_type": r["event_type"], "count": r["c"], "processed_count": r["processed_c"] or 0} for r in rows]
+
+
+def delete_transaction(txn_id: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM transactions WHERE txn_id=?", (txn_id,))
 
 
 # ============================================================================
@@ -807,7 +827,7 @@ class ModelBundle:
     models/ folder, and nothing to go stale on disk."""
 
     def __init__(self, mode, classifier, scaler, vocab, feature_names, train_features, train_matrix,
-                 pattern_findings, explain_classifier=None):
+                 pattern_findings, explain_classifier=None, metrics=None):
         self.mode = mode
         self.classifier = classifier
         self.explain_classifier = explain_classifier
@@ -817,6 +837,28 @@ class ModelBundle:
         self.train_features = train_features
         self.train_matrix = train_matrix
         self.pattern_findings = pattern_findings
+        self.metrics = metrics or {}
+
+
+def _cv_roc_auc(base_clf_factory, X: np.ndarray, y: np.ndarray, cv_folds: int) -> float | None:
+    """Actual measured predictive performance, not just "it's in ML mode
+    now": stratified k-fold cross-validated ROC-AUC using a FRESH classifier
+    per fold (never the one fit on all the data), so this number reflects
+    how well the model separates real held-out bank-rfi cases from
+    confirmed-negative ones. Surfaced on every model version so "is this
+    actually predicting anything" has a real answer instead of vibes. 0.5 =
+    no better than random; 1.0 = perfect separation. Returns None (not 0.5)
+    when there isn't enough data to fold reliably, so the dashboard can say
+    "not enough data yet" instead of implying "no better than random"."""
+    if cv_folds < 2:
+        return None
+    try:
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=0)
+        scores = cross_val_score(base_clf_factory(), X, y, cv=skf, scoring="roc_auc")
+        return round(float(np.mean(scores)), 4)
+    except Exception:  # noqa: BLE001 -- a metric failing must never block training
+        logger.exception("CV ROC-AUC computation failed")
+        return None
 
 
 def train_model(transactions: list[dict]) -> ModelBundle:
@@ -833,20 +875,50 @@ def train_model(transactions: list[dict]) -> ModelBundle:
     single categorical feature can add (see _vocab_for), and C is set low
     (stronger L2 regularization) rather than sklearn's default/previous
     C=2.0, which was permissive enough to let the model fit almost
-    anything, including noise."""
+    anything, including noise.
+
+    CRITICAL label-leakage fix: transactions that are still open/pending
+    review (review_status in OPEN_STATUSES) do NOT yet have a trustworthy
+    label. Earlier versions of this function trained on is_bank_rfi=0/1 for
+    EVERY transaction, including open ones -- which means a transaction
+    sitting in the candidate pool waiting to be scored had, at the exact
+    same time, already been fed into training as a confirmed "definitely
+    not bank-rfi" example. That's a direct feedback loop working against
+    the entire point of an early-warning system: the model was being taught
+    "this exact profile is safe" about the very transactions it was
+    supposed to flag as risky, right up until the moment Sumsub confirmed
+    otherwise. This is almost certainly why predictions looked flat/
+    uninformative despite real bank-rfi examples existing -- the model
+    wasn't wrong so much as trained on a self-defeating premise. Fixed by
+    building the training set only from RESOLVED transactions: every
+    bank-rfi-tagged transaction (a tag is ground truth the moment it's
+    applied, regardless of workflow status) plus every transaction whose
+    review has actually concluded without that tag. Currently-open
+    transactions are still fully eligible to be SCORED (see
+    score_all_open) -- they're just excluded from teaching the model what
+    "not risky" looks like until their own outcome is actually known."""
     history_index = build_applicant_history_index(transactions)
     feats = [extract_features(t, history_index) for t in transactions]
     for f, t in zip(feats, transactions):
         f["_is_bank_rfi"] = bool(t.get("is_bank_rfi"))
+        f["_is_open"] = t.get("review_status") in OPEN_STATUSES
 
     bank_rfi_feats = [f for f in feats if f["_is_bank_rfi"]]
-    other_feats = [f for f in feats if not f["_is_bank_rfi"]]
-    pattern_findings = analyze_patterns(bank_rfi_feats, other_feats)
+    confirmed_other_feats = [f for f in feats if not f["_is_bank_rfi"] and not f["_is_open"]]
+    excluded_open_feats = [f for f in feats if not f["_is_bank_rfi"] and f["_is_open"]]
+    labeled_feats = bank_rfi_feats + confirmed_other_feats
+    pattern_findings = analyze_patterns(bank_rfi_feats, confirmed_other_feats)
 
     vocab = {cat: _vocab_for(feats, cat) for cat in CATEGORICAL_FEATURES}
     feature_names = list(NUMERIC_FEATURES) + [f"{cat}={v}" for cat in CATEGORICAL_FEATURES for v in vocab[cat]]
 
-    if len(bank_rfi_feats) < MIN_ML_SAMPLES:
+    base_metrics = {
+        "n_bank_rfi": len(bank_rfi_feats),
+        "n_confirmed_other": len(confirmed_other_feats),
+        "n_excluded_open_pending": len(excluded_open_feats),
+    }
+
+    if len(bank_rfi_feats) < MIN_ML_SAMPLES or len(confirmed_other_feats) < MIN_ML_SAMPLES:
         scaler = StandardScaler()
         if feats:
             _vectorize(feats, vocab, scaler, fit_scaler=True)
@@ -854,26 +926,51 @@ def train_model(transactions: list[dict]) -> ModelBundle:
         bundle = ModelBundle(
             mode="heuristic", classifier=None, scaler=scaler, vocab=vocab, feature_names=feature_names,
             train_features=bank_rfi_feats, train_matrix=train_matrix, pattern_findings=pattern_findings,
+            metrics={
+                **base_metrics,
+                "reason": (
+                    f"Need at least {MIN_ML_SAMPLES} bank-rfi examples AND {MIN_ML_SAMPLES} confirmed "
+                    f"non-bank-rfi examples (transactions whose review has actually concluded) before "
+                    f"switching to a calibrated classifier -- currently {len(bank_rfi_feats)} bank-rfi / "
+                    f"{len(confirmed_other_feats)} confirmed-other ({len(excluded_open_feats)} more are "
+                    f"still open/pending review and can't be used as training negatives yet)."
+                ),
+            },
         )
     else:
         scaler = StandardScaler()
-        X = _vectorize(feats, vocab, scaler, fit_scaler=True)
-        y = np.array([1 if f["_is_bank_rfi"] else 0 for f in feats])
+        X_labeled = _vectorize(labeled_feats, vocab, scaler, fit_scaler=True)
+        y = np.array([1 if f["_is_bank_rfi"] else 0 for f in labeled_feats])
 
         explain_clf = LogisticRegression(max_iter=3000, class_weight="balanced", C=0.3)
-        explain_clf.fit(X, y)
+        explain_clf.fit(X_labeled, y)
 
         n_pos = int(y.sum())
-        cv_folds = max(2, min(5, n_pos // 5))
+        n_neg = int(len(y) - n_pos)
+        cv_folds = max(2, min(5, n_pos // 5, n_neg // 5))
         base_clf = LogisticRegression(max_iter=3000, class_weight="balanced", C=0.3)
         clf = CalibratedClassifierCV(base_clf, method="sigmoid", cv=cv_folds)
-        clf.fit(X, y)
+        clf.fit(X_labeled, y)
+
+        cv_auc = _cv_roc_auc(
+            lambda: LogisticRegression(max_iter=3000, class_weight="balanced", C=0.3), X_labeled, y, cv_folds,
+        )
 
         rfi_matrix = _vectorize(bank_rfi_feats, vocab, scaler)
         bundle = ModelBundle(
             mode="ml", classifier=clf, scaler=scaler, vocab=vocab, feature_names=feature_names,
             train_features=bank_rfi_feats, train_matrix=rfi_matrix, pattern_findings=pattern_findings,
             explain_classifier=explain_clf,
+            metrics={
+                **base_metrics,
+                "cv_folds": cv_folds,
+                "cv_roc_auc": cv_auc,
+                "cv_roc_auc_note": (
+                    "0.5 = no better than a coin flip, 1.0 = perfect separation of held-out bank-rfi vs. "
+                    "confirmed-other transactions. Computed with fresh cross-validation folds, not on data "
+                    "the final model was fit on."
+                ),
+            },
         )
 
     return bundle
@@ -1210,6 +1307,11 @@ def backfill_from_txn_query(client: SumsubClient, days_back: int = 2, limit: int
 
 _backfill_history_job = {"running": False, "months_done": 0, "months_total": 0, "result": None,
                           "started_at": None, "finished_at": None}
+# Diagnostics for _maybe_auto_backfill_on_empty_db (defined further down, after
+# get_client/_run_backfill_history_job_in_background exist) -- surfaced on
+# /api/setup so the dashboard can explain *why* a backfill started on its own,
+# instead of a mysterious status change.
+_startup_auto_backfill = {"attempted": False, "reason": None, "months_back": None}
 
 
 def run_deep_historical_backfill(client: SumsubClient, months_back: int = 84, max_empty_months: int = 18,
@@ -1339,226 +1441,93 @@ def run_full_backfill(client: SumsubClient) -> dict:
     return {"started": started, "finished": finished, "results": results, "scanned": scanned, "new_bank_rfi": new_rfi}
 
 
-def process_webhook_event(client: SumsubClient, event: dict) -> dict | None:
+def _webhook_txn_id(event: dict) -> str | None:
+    """The real Sumsub KYT webhook payload field names (confirmed against
+    docs.sumsub.com/docs/transaction-monitoring-webhooks, which documents
+    all 11 transaction-monitoring event types) are `kytTxnId` (Sumsub's own
+    ID) and `kytDataTxnId` (the client-supplied external ID, present when
+    you submitted the transaction with your own ID attached) -- NOT `txnId`,
+    which doesn't appear in that payload shape at all. An earlier version of
+    this function fell back to `event.get("txnId")`, which could never
+    actually match anything and masked cases where `kytTxnId` was legitimately
+    missing (e.g. an AML case event, which isn't about a single transaction)."""
+    return event.get("kytTxnId") or event.get("kytDataTxnId")
+
+
+# Every transaction-monitoring event type Sumsub can send (see
+# docs.sumsub.com/docs/transaction-monitoring-webhooks). Listed explicitly
+# (rather than just accepting anything with a kytTxnId) so a new/unexpected
+# type shows up distinctly in the event-type breakdown instead of silently
+# blending in -- that breakdown is the main diagnostic for "is Sumsub even
+# sending me applicantKytTxnCreated events" (see webhook_event_type_breakdown).
+KNOWN_KYT_EVENT_TYPES = {
+    "applicantKytTxnCreated", "applicantKytTxnApproved", "applicantKytTxnRejected",
+    "applicantKytTxnReviewed", "applicantKytTxnDeleted", "applicantKytOnHold",
+    "applicantKytTxnAwaitingUser", "applicantKytTxnDataChanged",
+    "amlCaseApproved", "amlCaseRejected", "amlCaseOnHold",
+}
+
+
+def verify_webhook_signature(raw_body: bytes, digest_header: str | None, alg_header: str | None) -> tuple[bool, str]:
+    """Confirms a webhook POST actually came from Sumsub, using the secret
+    key from Sumsub Dashboard -> Webhook manager (SUMSUB_WEBHOOK_SECRET_KEY).
+    Per docs.sumsub.com/docs/webhook-manager: Sumsub computes an HMAC digest
+    over the RAW request body bytes (not re-serialized JSON -- whitespace/key
+    order would change the bytes and break the digest) using the secret key
+    and the algorithm named in the `X-Payload-Digest-Alg` header, then sends
+    the hex digest in the `x-payload-digest` header. Verification is just
+    recomputing that same HMAC locally and comparing with a constant-time
+    comparison (hmac.compare_digest, so response-timing can't leak the
+    correct value one byte at a time).
+
+    Returns (is_valid, detail). If SUMSUB_WEBHOOK_SECRET_KEY isn't
+    configured, this ALWAYS returns (True, "..."), i.e. verification is
+    opt-in but permissive by default -- so the bot keeps working out of the
+    box, and the Setup panel separately and loudly flags that verification
+    is off (see /api/setup's webhook_signature_verification field) rather
+    than silently rejecting real events for an operator who hasn't set the
+    secret yet."""
+    if not SUMSUB_WEBHOOK_SECRET_KEY:
+        return True, "signature verification disabled (SUMSUB_WEBHOOK_SECRET_KEY not set)"
+    if not digest_header:
+        return False, "missing x-payload-digest header"
+    alg_name = (alg_header or "").strip().upper()
+    hasher = WEBHOOK_DIGEST_ALGOS.get(alg_name)
+    if hasher is None:
+        return False, f"unsupported/missing X-Payload-Digest-Alg '{alg_header}' (expected one of {sorted(WEBHOOK_DIGEST_ALGOS)})"
+    computed = hmac.new(SUMSUB_WEBHOOK_SECRET_KEY.encode("utf-8"), raw_body, hasher).hexdigest()
+    if hmac.compare_digest(computed, digest_header.strip()):
+        return True, f"signature verified ({alg_name})"
+    return False, f"signature mismatch ({alg_name}) -- payload does not match SUMSUB_WEBHOOK_SECRET_KEY"
+
+
+def process_webhook_event(client: SumsubClient, event: dict) -> tuple[dict | None, str]:
     """Note: the webhook route already records receipt of every event (see
     api_sumsub_webhook) before calling this -- this function is purely about
-    actually fetching and storing the transaction once credentials exist."""
-    kyt_txn_id = event.get("kytTxnId") or event.get("txnId")
+    actually fetching and storing (or removing) the transaction once
+    credentials exist. Returns (row_or_None, detail_string) -- the detail
+    string is persisted onto the webhook_events row so a failure/skip reason
+    is visible per-event instead of just a boolean."""
+    event_type = event.get("type") or "unknown"
+    kyt_txn_id = _webhook_txn_id(event)
+
+    if event_type == "applicantKytTxnDeleted":
+        # Sumsub removed this transaction and its data -- mirror that here
+        # instead of trying to re-fetch it (which would just 404 and look
+        # like an unrelated failure) so deleted transactions don't linger
+        # forever as stale training/candidate rows.
+        if not kyt_txn_id:
+            return None, "applicantKytTxnDeleted with no kytTxnId -- nothing to remove"
+        delete_transaction(kyt_txn_id)
+        return {"txn_id": kyt_txn_id, "deleted": True, "is_bank_rfi": False}, "deleted local copy"
+
     if not kyt_txn_id:
-        return None
-    return ingest_single_txn(client, kyt_txn_id)
+        return None, f"no kytTxnId/kytDataTxnId on this {event_type} event -- nothing to fetch"
 
-
-# ============================================================================
-# Slack alerting -- posts every transaction the MODEL flags as high-risk
-# (predicted_score >= SLACK_ALERT_THRESHOLD) to Slack, via the Web API
-# (chat.postMessage) or an Incoming Webhook -- see slack_configured() /
-# send_slack_alert() below for which one wins. No-ops entirely if neither
-# is configured, so this is safe to leave in place before Slack is set up.
-# ============================================================================
-
-def slack_configured() -> bool:
-    rotating_ready = bool(SLACK_CLIENT_ID and SLACK_CLIENT_SECRET
-                           and (load_slack_oauth_state() or (SLACK_ACCESS_TOKEN and SLACK_REFRESH_TOKEN)))
-    return bool((rotating_ready or (SLACK_BOT_TOKEN)) and SLACK_CHANNEL) or bool(SLACK_WEBHOOK_URL)
-
-
-def _get_valid_slack_access_token() -> str | None:
-    """Returns a currently-valid rotating Slack access token, refreshing it
-    first via oauth.v2.access if the stored one is missing/expired/about to
-    expire. Returns None if the rotating-token flow isn't configured at all
-    (SLACK_CLIENT_ID/SLACK_CLIENT_SECRET missing) -- callers should fall
-    back to SLACK_BOT_TOKEN or the webhook in that case, see send_slack_alert.
-
-    Why this exists: Slack's token-rotation access tokens
-    (xoxe.xoxb-.../xoxe.xoxp-...) expire in ~12 hours and MUST be exchanged
-    for a new pair via the refresh token before then -- unlike a classic
-    static xoxb-... bot token, which never expires. Each refresh also
-    invalidates the refresh token just used and issues a new one, so the
-    live pair is persisted in the slack_oauth_state table (seeded once from
-    SLACK_ACCESS_TOKEN/SLACK_REFRESH_TOKEN) rather than re-read from the env
-    vars every time -- the env vars are only good for the very first call."""
-    if not (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET):
-        return None
-
-    state = load_slack_oauth_state()
-    if state is None:
-        if not (SLACK_ACCESS_TOKEN and SLACK_REFRESH_TOKEN):
-            return None
-        # First-ever call: seed from the env vars but treat the seed as
-        # already expired (datetime.min) so the block below immediately
-        # refreshes it. We don't know the true remaining lifetime of a
-        # pasted-in access token, so starting from a forced refresh
-        # establishes a known-good expires_at rather than guessing.
-        save_slack_oauth_state(SLACK_ACCESS_TOKEN, SLACK_REFRESH_TOKEN, datetime.min)
-        state = load_slack_oauth_state()
-
-    expires_at = datetime.min
-    if state.get("expires_at"):
-        try:
-            expires_at = datetime.fromisoformat(state["expires_at"])
-        except ValueError:
-            pass
-
-    # Written as "now + buffer < expires_at" rather than "now < expires_at -
-    # buffer" so this never subtracts from the datetime.min sentinel (a
-    # forced-refresh seed) and overflows -- adding a few minutes to "now" is
-    # always safe.
-    if datetime.utcnow() + timedelta(seconds=SLACK_TOKEN_REFRESH_BUFFER_SECONDS) < expires_at:
-        return state["access_token"]  # still comfortably valid -- no network call needed
-
-    try:
-        resp = requests.post(
-            "https://slack.com/api/oauth.v2.access",
-            data={
-                "client_id": SLACK_CLIENT_ID,
-                "client_secret": SLACK_CLIENT_SECRET,
-                "grant_type": "refresh_token",
-                "refresh_token": state["refresh_token"],
-            },
-            timeout=10,
-        )
-        body = resp.json()
-    except Exception:  # noqa: BLE001 -- a refresh hiccup must never break ingestion/retraining
-        logger.exception("Slack token refresh request failed -- using last-known access token")
-        return state.get("access_token")
-
-    if not body.get("ok"):
-        logger.warning("Slack token refresh failed: %s", body)
-        return state.get("access_token")
-
-    new_access_token = body.get("access_token")
-    new_refresh_token = body.get("refresh_token") or state["refresh_token"]
-    expires_in = int(body.get("expires_in") or 43200)  # Slack's default rotating-token lifetime is 12h (43200s)
-    new_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
-    save_slack_oauth_state(new_access_token, new_refresh_token, new_expires_at)
-    logger.info("Refreshed Slack access token -- valid until %s UTC", new_expires_at.isoformat())
-    return new_access_token
-
-
-def send_slack_alert(text: str, blocks: list[dict] | None = None) -> bool:
-    """Delivers via the Slack Web API, preferring the rotating token pair
-    (SLACK_CLIENT_ID/SECRET + SLACK_ACCESS_TOKEN/SLACK_REFRESH_TOKEN) if
-    configured, then a classic static SLACK_BOT_TOKEN, then falling back to
-    SLACK_WEBHOOK_URL; otherwise no-ops. See the config comment above
-    SLACK_CLIENT_ID for how to set up each path."""
-    if SLACK_CHANNEL:
-        rotating_token = _get_valid_slack_access_token()
-        if rotating_token:
-            return _send_via_slack_api(rotating_token, text, blocks)
-        if SLACK_BOT_TOKEN:
-            return _send_via_slack_api(SLACK_BOT_TOKEN, text, blocks)
-    if SLACK_WEBHOOK_URL:
-        return _send_via_webhook(text, blocks)
-    logger.info(
-        "Slack isn't configured (set SLACK_CLIENT_ID+SLACK_CLIENT_SECRET+SLACK_ACCESS_TOKEN+SLACK_REFRESH_TOKEN+"
-        "SLACK_CHANNEL, or SLACK_BOT_TOKEN+SLACK_CHANNEL, or SLACK_WEBHOOK_URL) -- skipping alert: %s", text,
-    )
-    return False
-
-
-def _send_via_slack_api(token: str, text: str, blocks: list[dict] | None) -> bool:
-    payload: dict = {"channel": SLACK_CHANNEL, "text": text}
-    if blocks:
-        payload["blocks"] = blocks
-    try:
-        resp = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-            json=payload, timeout=10,
-        )
-        # chat.postMessage always replies HTTP 200 with JSON, even on
-        # failure -- the real success/failure signal is the "ok" field
-        # (errors like "not_in_channel", "channel_not_found", "invalid_auth"
-        # come back this way, not as a non-200 status).
-        body = {}
-        try:
-            body = resp.json()
-        except ValueError:
-            pass
-        if not body.get("ok"):
-            logger.warning("Slack API chat.postMessage failed (HTTP %s): %s", resp.status_code, body or resp.text[:300])
-            return False
-        return True
-    except Exception:  # noqa: BLE001 -- a Slack hiccup must never break ingestion/retraining
-        logger.exception("Slack API request failed")
-        return False
-
-
-def _send_via_webhook(text: str, blocks: list[dict] | None) -> bool:
-    payload: dict = {"text": text}
-    if blocks:
-        payload["blocks"] = blocks
-    try:
-        resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
-        if resp.status_code != 200:
-            # Slack's Incoming Webhook endpoint replies with plain "ok" (200)
-            # on success and a short plain-text error otherwise (e.g.
-            # "invalid_payload", "channel_not_found") -- log the body since
-            # there's no JSON to parse.
-            logger.warning("Slack webhook alert failed (HTTP %s): %s", resp.status_code, resp.text[:300])
-            return False
-        return True
-    except Exception:  # noqa: BLE001 -- a Slack hiccup must never break ingestion/retraining
-        logger.exception("Slack webhook request failed")
-        return False
-
-
-def _format_slack_alert(score: dict, txn: dict) -> tuple[str, list[dict]]:
-    pct = f"{score['risk_score'] * 100:.0f}%"
-    amount = txn.get("amount")
-    currency = txn.get("currency") or ""
-    country = txn.get("counterparty_country") or "unknown"
-    reasons = score.get("reasons") or []
-    reason_text = "\n".join(f"• {r}" for r in reasons[:3]) or (
-        "No single dominant reason -- a combination of weaker signals pushed this over the threshold."
-    )
-    fallback_text = (
-        f":rotating_light: Flagged transaction -- {pct} predicted bank-RFI risk "
-        f"(`{score['txn_id']}`, {amount} {currency}, counterparty: {country})"
-    )
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text",
-                                     "text": f"\U0001F6A8 Flagged transaction -- {pct} predicted bank-RFI risk"[:150]}},
-        {"type": "section", "fields": [
-            {"type": "mrkdwn", "text": f"*Transaction ID:*\n`{score['txn_id']}`"},
-            {"type": "mrkdwn", "text": f"*Risk score:*\n{pct}"},
-            {"type": "mrkdwn", "text": f"*Amount:*\n{amount} {currency}".strip()},
-            {"type": "mrkdwn", "text": f"*Counterparty country:*\n{country}"},
-        ]},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Why:*\n{reason_text}"}},
-    ]
-    return fallback_text, blocks
-
-
-def check_and_send_slack_alerts():
-    """Called after every retrain (see retrain_only). Re-scores the
-    candidate pool, and for any transaction that has just crossed
-    SLACK_ALERT_THRESHOLD and hasn't been alerted on before, posts it to
-    Slack and flips its slack_alerted flag -- so each transaction the model
-    flags posts exactly once, not again on every subsequent hourly retrain
-    while its score stays elevated."""
-    if not slack_configured() or _current_bundle is None:
-        return
-    try:
-        txns = all_transactions()
-        candidates = transactions_since_last_bank_rfi(txns)
-        if not candidates:
-            return
-        by_id = {t["txn_id"]: t for t in txns}
-        scored = score_all_open(candidates, txns, _current_bundle)
-        for s in scored:
-            if s["risk_score"] < SLACK_ALERT_THRESHOLD:
-                continue
-            txn = by_id.get(s["txn_id"])
-            if not txn or txn.get("slack_alerted"):
-                continue
-            text, blocks = _format_slack_alert(s, txn)
-            if send_slack_alert(text, blocks):
-                mark_slack_alerted(s["txn_id"])
-                logger.info("Slack-alerted txn %s (risk_score=%.3f)", s["txn_id"], s["risk_score"])
-    except Exception:  # noqa: BLE001 -- alerting must never break retraining
-        logger.exception("Slack alert sweep failed")
+    row = ingest_single_txn(client, kyt_txn_id)
+    if row is None:
+        return None, f"ingest_single_txn failed for {kyt_txn_id} (see server logs for the exact Sumsub error)"
+    return row, "ok"
 
 
 # ============================================================================
@@ -1632,12 +1601,15 @@ def retrain_only():
         if txns:
             _current_bundle = train_model(txns)
             record_model_version(
-                mode=_current_bundle.mode, n_bank_rfi=len(_current_bundle.train_features),
-                n_other=len(txns) - len(_current_bundle.train_features),
-                metrics={"n_training_rows": len(txns)}, feature_importances=_feature_importances(_current_bundle),
+                mode=_current_bundle.mode, n_bank_rfi=_current_bundle.metrics.get("n_bank_rfi", len(_current_bundle.train_features)),
+                n_other=_current_bundle.metrics.get("n_confirmed_other", 0),
+                metrics={"n_training_rows": len(txns), **_current_bundle.metrics},
+                feature_importances=_feature_importances(_current_bundle),
             )
-            logger.info("Retrained model in %s mode on %d transactions", _current_bundle.mode, len(txns))
-            check_and_send_slack_alerts()
+            logger.info(
+                "Retrained model in %s mode on %d transactions (cv_roc_auc=%s)",
+                _current_bundle.mode, len(txns), _current_bundle.metrics.get("cv_roc_auc"),
+            )
         else:
             logger.info("No transactions in the database yet -- nothing to train on.")
     except Exception:
@@ -1673,6 +1645,54 @@ def _ensure_bundle_loaded():
             _current_bundle = train_model(txns)
 
 
+def _maybe_auto_backfill_on_empty_db():
+    """Self-healing for the common "count went back to 0" symptom: on
+    Render's Free/Starter plans (no persistent disk configured -- see
+    _db_likely_ephemeral and the README's "Deploying on Render" section),
+    every restart/redeploy wipes the SQLite file. That doesn't break
+    ingestion -- the webhook keeps working fine -- but it silently resets
+    total_bank_rfi to 0 and it STAYS 0 until either someone notices and
+    clicks "Run full historical backfill" by hand, or enough brand-new
+    webhook events happen to carry the bank-rfi tag on their own. Rather
+    than requiring a person to notice and intervene after every deploy,
+    kick off a fresh deep historical backfill automatically, once, whenever
+    the transactions table comes up completely empty at startup and
+    credentials are configured. Runs on a plain background thread (not
+    BackgroundTasks, since there's no request/response cycle at startup to
+    hang it off of) so it doesn't block the app from starting to serve
+    traffic. Uses the SAME job/state (_backfill_history_job) as the manual
+    "Run full historical backfill" button, so its progress is visible in
+    exactly the same place."""
+    global _startup_auto_backfill
+    try:
+        existing = len(all_transactions())
+    except Exception:  # noqa: BLE001 -- DB not ready is not fatal, just skip
+        logger.exception("Could not check transaction count for auto-backfill")
+        return
+    if existing != 0:
+        _startup_auto_backfill.update(
+            attempted=False, reason=f"{existing} transaction(s) already stored -- no auto-backfill needed", months_back=None,
+        )
+        return
+    client = get_client()
+    if client is None:
+        _startup_auto_backfill.update(
+            attempted=False, reason="Database is empty but Sumsub credentials aren't configured yet.", months_back=None,
+        )
+        return
+    months_back = 60
+    _backfill_history_job.update(running=True, months_done=0, months_total=months_back, result=None,
+                                  started_at=datetime.now(timezone.utc).isoformat(), finished_at=None)
+    _startup_auto_backfill.update(
+        attempted=True,
+        reason="Database was empty at startup (most likely a redeploy on a non-persistent filesystem -- "
+               "see db_likely_ephemeral) -- automatically running a fresh historical backfill now.",
+        months_back=months_back,
+    )
+    logger.info("Transactions table empty at startup -- auto-starting a %d-month historical backfill.", months_back)
+    threading.Thread(target=_run_backfill_history_job_in_background, args=(client, months_back), daemon=True).start()
+
+
 @app.on_event("startup")
 def on_startup():
     _ensure_bundle_loaded()
@@ -1685,6 +1705,24 @@ def on_startup():
         "Safety-net backfill+retrain scheduled every %d minute(s) -- but the model actually "
         "retrains immediately on every webhook event, not on this timer.", INGEST_INTERVAL_MINUTES,
     )
+    _maybe_auto_backfill_on_empty_db()
+
+
+def _db_likely_ephemeral() -> bool:
+    """Best-effort heuristic, not a guarantee: the DB path is "likely
+    ephemeral" if it lives under this app's own source checkout (the
+    default, ./bank_rfi_bot.db) rather than a separately-mounted path like
+    Render's /data disk. On Render's Free/Starter plans (see README), the
+    app's own filesystem -- including a DB file left at the default path --
+    is wiped on every restart/redeploy, which silently resets total_bank_rfi
+    back to 0 even though nothing about the ingestion logic is broken. This
+    is surfaced here because it is the single most common explanation for
+    "the count went back to 0" after a code change ships."""
+    try:
+        resolved = os.path.abspath(DB_PATH)
+        return resolved == os.path.abspath(os.path.join(HERE, "bank_rfi_bot.db")) or resolved.startswith(HERE + os.sep)
+    except Exception:  # noqa: BLE001
+        return True
 
 
 @app.get("/api/setup")
@@ -1692,25 +1730,29 @@ def api_setup(request: Request):
     conn = check_sumsub_connection()
     txns = all_transactions()
     base = str(request.base_url).rstrip("/")
+    tag_diagnostics = distinct_raw_tags(txns)
+    event_types = webhook_event_type_breakdown()
+    seen_types = {e["event_type"] for e in event_types}
+    invalid_sig_count = next((e["count"] for e in event_types if e["event_type"] == "invalid_signature"), 0)
+    real_event_types = [e for e in event_types if e["event_type"] != "invalid_signature"]
     return {
         "credentials_configured": conn["status"] != "not_configured",
         "connection_status": conn["status"],
         "connection_detail": conn["detail"],
         "webhook_url": f"{base}/api/webhooks/sumsub",
         "webhook_events_received": webhook_event_count(),
+        "webhook_event_types": real_event_types,
+        "webhook_missing_txn_created": bool(real_event_types) and "applicantKytTxnCreated" not in seen_types,
+        "webhook_signature_verification": "enabled" if SUMSUB_WEBHOOK_SECRET_KEY else "disabled_no_secret",
+        "webhook_invalid_signature_count": invalid_sig_count,
         "total_transactions": len(txns),
         "total_bank_rfi": len([t for t in txns if t["is_bank_rfi"]]),
         "bank_rfi_tag": BANK_RFI_TAG,
         "ingest_interval_minutes": INGEST_INTERVAL_MINUTES,
-        "slack_configured": slack_configured(),
-        "slack_mode": (
-            "api_rotating" if (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET and SLACK_CHANNEL
-                                and (load_slack_oauth_state() or (SLACK_ACCESS_TOKEN and SLACK_REFRESH_TOKEN)))
-            else "api_static" if (SLACK_BOT_TOKEN and SLACK_CHANNEL)
-            else "webhook" if SLACK_WEBHOOK_URL
-            else "none"
-        ),
-        "slack_alert_threshold": SLACK_ALERT_THRESHOLD,
+        "db_path": DB_PATH,
+        "db_likely_ephemeral": _db_likely_ephemeral(),
+        "distinct_tags_seen": tag_diagnostics,
+        "auto_backfill": dict(_startup_auto_backfill),
     }
 
 
@@ -1725,12 +1767,17 @@ def api_summary():
     rfi = [t for t in txns if t["is_bank_rfi"]]
     latest_version = latest_model_version()
     cutoff = most_recent_bank_rfi_timestamp(txns)
+    metrics = (latest_version or {}).get("metrics_json") or {}
     return {
         "total_transactions": len(txns), "total_bank_rfi": len(rfi),
         "candidate_transactions": len(transactions_since_last_bank_rfi(txns)),
         "last_bank_rfi_at": cutoff.isoformat() if cutoff else None,
         "model_mode": latest_version["mode"] if latest_version else "untrained",
         "model_trained_at": latest_version["trained_at"] if latest_version else None,
+        "model_cv_roc_auc": metrics.get("cv_roc_auc"),
+        "model_n_confirmed_other": metrics.get("n_confirmed_other"),
+        "model_n_excluded_open_pending": metrics.get("n_excluded_open_pending"),
+        "model_heuristic_reason": metrics.get("reason"),
         "recent_ingestion_runs": recent_ingestion_runs(5),
     }
 
@@ -1786,22 +1833,6 @@ def api_model_history():
 def api_trigger_ingest():
     run_ingest_and_retrain()
     return {"status": "completed", "summary": api_summary()}
-
-
-@app.post("/api/slack/test")
-def api_slack_test():
-    """Sends one harmless test message to the configured Slack channel, so
-    the Slack wiring (API token+channel, or webhook URL) can be verified
-    without waiting for a real transaction to cross the risk threshold."""
-    if not slack_configured():
-        return JSONResponse(
-            {"error": "Slack isn't set up yet -- set SLACK_CLIENT_ID+SLACK_CLIENT_SECRET+SLACK_ACCESS_TOKEN+"
-                      "SLACK_REFRESH_TOKEN+SLACK_CHANNEL (rotating token), or SLACK_BOT_TOKEN+SLACK_CHANNEL "
-                      "(static token), or SLACK_WEBHOOK_URL, in Render's Environment tab and redeploy."},
-            status_code=400,
-        )
-    ok = send_slack_alert(":white_check_mark: Bank RFI Prediction Bot -- Slack alerting is connected and working.")
-    return {"sent": ok}
 
 
 def _run_import_job_in_background(client: SumsubClient, raw_ids: list[str]):
@@ -1913,7 +1944,7 @@ def api_backfill_history_status():
     return {**_backfill_history_job, "summary": api_summary() if not _backfill_history_job["running"] else None}
 
 
-def _process_webhook_event_in_background(event: dict):
+def _process_webhook_event_in_background(event: dict, event_row_id: int):
     """Runs AFTER the HTTP response has already been sent (see
     api_sumsub_webhook) -- this is what actually fetches the transaction and
     retrains. Keeping it out of the request/response path matters: Sumsub's
@@ -1926,38 +1957,83 @@ def _process_webhook_event_in_background(event: dict):
     client = get_client()
     if client is None:
         logger.warning("Webhook received but credentials aren't set yet: %s", event)
+        mark_webhook_event_processed(event_row_id, ok=False, detail="Sumsub credentials not configured")
         return
     try:
-        row = process_webhook_event(client, event)
+        row, detail = process_webhook_event(client, event)
+        mark_webhook_event_processed(event_row_id, ok=row is not None, detail=detail)
         if row:
-            # Retrain on EVERY real transaction event -- tagged "bank rfi"
-            # or not -- so the model, the candidate pool, and the pattern
-            # stats are current within seconds of Sumsub sending this event.
-            # This is the bot's actual "constantly running" mechanism; the
-            # hourly job is only a safety net (see run_ingest_and_retrain's
-            # docstring).
-            tag_note = "new bank-rfi transaction" if row.get("is_bank_rfi") else "transaction update"
+            # Retrain on EVERY real transaction event -- created, reviewed,
+            # approved, rejected, or deleted -- so the model, the candidate
+            # pool, and the pattern stats are current within seconds of
+            # Sumsub sending this event. This is the bot's actual
+            # "constantly running" mechanism; the hourly job is only a
+            # safety net (see run_ingest_and_retrain's docstring).
+            if row.get("deleted"):
+                tag_note = "transaction deleted on Sumsub"
+            elif row.get("is_bank_rfi"):
+                tag_note = "new bank-rfi transaction"
+            else:
+                tag_note = "transaction update"
             logger.info("Webhook event processed (%s): %s -- retraining now", tag_note, row["txn_id"])
             retrain_only()
-    except Exception:
+        else:
+            logger.info("Webhook event not ingested: %s", detail)
+    except Exception as e:  # noqa: BLE001
         logger.exception("Failed to process webhook event: %s", event)
+        mark_webhook_event_processed(event_row_id, ok=False, detail=f"unhandled exception: {e}")
 
 
 @app.post("/api/webhooks/sumsub")
 async def api_sumsub_webhook(request: Request, background_tasks: BackgroundTasks):
     """Register this URL in Sumsub Dashboard -> Settings -> Webhooks for
-    Transaction Monitoring events. Responds immediately (see
-    _process_webhook_event_in_background for why that matters) -- the
-    actual fetch-and-retrain work happens after the response is sent."""
-    event = await request.json()
+    Transaction Monitoring events. IMPORTANT: Sumsub only sends the event
+    types you explicitly enable when registering the webhook -- there isn't
+    one single "any transaction change" event. In particular, the event
+    that fires the moment a NEW transaction is first created is
+    `applicantKytTxnCreated`, which is a DIFFERENT checkbox from the
+    review-outcome events (approved/rejected/reviewed/on-hold). If that
+    checkbox isn't enabled on Sumsub's side, brand-new transactions won't
+    reach this endpoint in real time no matter what this code does -- check
+    the Setup panel's event-type breakdown (GET /api/setup ->
+    webhook_event_types) to see exactly which event types have actually
+    arrived, and see docs.sumsub.com/docs/transaction-monitoring-webhooks
+    for the full list to enable.
+
+    Responds immediately (see _process_webhook_event_in_background for why
+    that matters) -- the actual fetch-and-retrain work happens after the
+    response is sent.
+
+    Signature verification (if SUMSUB_WEBHOOK_SECRET_KEY is set -- see that
+    variable's definition for how to get this key from Sumsub) happens
+    BEFORE any of that: it's a cheap local HMAC computation, so it doesn't
+    hurt Sumsub's response-time budget, and it means a forged/unauthenticated
+    POST to this public URL is rejected outright instead of being treated as
+    a real transaction event."""
+    raw_body = await request.body()
+    is_valid, sig_detail = verify_webhook_signature(
+        raw_body, request.headers.get("x-payload-digest"), request.headers.get("x-payload-digest-alg"),
+    )
+    if not is_valid:
+        logger.warning("Rejected webhook POST with invalid signature: %s", sig_detail)
+        record_webhook_event("invalid_signature", "unknown", {"detail": sig_detail})
+        return JSONResponse({"error": "invalid signature", "detail": sig_detail}, status_code=401)
+
+    try:
+        event = json.loads(raw_body)
+    except ValueError:
+        logger.warning("Webhook POST body wasn't valid JSON (signature check: %s)", sig_detail)
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    event_type = event.get("type") or "unknown"
     # Record receipt unconditionally (even without credentials or a
     # recognizable txn id) so the Setup panel can confirm "yes, Sumsub is
     # reaching this URL" independently of whether ingestion succeeds. This
     # is a single fast local DB write, not an API call, so it's safe to do
     # before responding.
-    record_webhook_event(event.get("type", "unknown"), event.get("kytTxnId") or event.get("txnId") or "unknown", event)
-    background_tasks.add_task(_process_webhook_event_in_background, event)
-    return {"received": True}
+    row_id = record_webhook_event(event_type, _webhook_txn_id(event) or "unknown", event)
+    background_tasks.add_task(_process_webhook_event_in_background, event, row_id)
+    return {"received": True, "signature": sig_detail}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2144,6 +2220,7 @@ FRONTEND_HTML = r"""<!doctype html>
         <p class="desc">Statistically significant differences between transactions that were tagged &ldquo;bank rfi&rdquo; and everything else the bot has seen so far.</p>
         <ul class="narrative" id="narrative"></ul>
         <div id="categoricalBars" style="margin-top:16px;"></div>
+        <div id="rawTagsDiag" style="margin-top:16px;"></div>
       </div>
     </details>
 
@@ -2152,7 +2229,7 @@ FRONTEND_HTML = r"""<!doctype html>
       <div class="details-body">
         <p class="desc">Every retrain is logged for audit purposes &mdash; this is a compliance tool, so nothing here is a black box.</p>
         <table id="historyTable">
-          <thead><tr><th>Trained at</th><th>Mode</th><th>Bank-rfi examples</th><th>Other transactions</th></tr></thead>
+          <thead><tr><th>Trained at</th><th>Mode</th><th>Bank-rfi examples</th><th>Confirmed-other examples</th><th>Excluded (open/pending)</th><th>CV ROC-AUC</th></tr></thead>
           <tbody id="historyBody"></tbody>
         </table>
       </div>
@@ -2207,32 +2284,65 @@ function renderSetup(s) {
     rows.push({icon: "warn", text: `<strong>Can't reach Sumsub right now.</strong> ${s.connection_detail}`});
   }
   const webhookRegistered = s.webhook_events_received > 0;
+  const eventTypePills = (s.webhook_event_types||[]).map(e => `<span class="pill">${e.event_type} &times;${e.count} (${e.processed_count} ingested)</span>`).join(" ");
   rows.push({
     icon: webhookRegistered ? "good" : "warn",
     text: (webhookRegistered
-      ? `<strong>Webhook is live</strong> -- ${s.webhook_events_received.toLocaleString()} event(s) received so far. This is the mechanism that keeps ingesting new data straight from Sumsub with no separate data files.`
-      : `<strong>No webhook events received yet.</strong> This checks whether Sumsub has actually sent anything here -- it can't check Sumsub's own settings (Sumsub doesn't expose an API for that), so if you've <em>already</em> registered the URL below, this just means no matching event has fired yet, not that registration failed. If you just set it up, try clicking "Test webhook" in Sumsub's Webhook manager, or check Sumsub's own <strong>Webhook logs</strong> page to see delivery attempts and their status directly. If you haven't registered it yet, add this URL in Sumsub Dashboard &rarr; Webhook manager for Transaction Monitoring events:`)
+      ? `<strong>Webhook is live</strong> -- ${s.webhook_events_received.toLocaleString()} event(s) received so far. This is the mechanism that keeps ingesting new data straight from Sumsub with no separate data files.${eventTypePills ? `<br/><span style="color:var(--text-secondary);">Event types seen (last 14 days):</span> ${eventTypePills}` : ""}`
+      : `<strong>No webhook events received yet.</strong> This checks whether Sumsub has actually sent anything here -- it can't check Sumsub's own settings (Sumsub doesn't expose an API for that), so if you've <em>already</em> registered the URL below, this just means no matching event has fired yet, not that registration failed. If you just set it up, try clicking "Test webhook" in Sumsub's Webhook manager, or check Sumsub's own <strong>Webhook logs</strong> page to see delivery attempts and their status directly. If you haven't registered it yet, add this URL in Sumsub Dashboard &rarr; Webhook manager for Transaction Monitoring events, making sure to enable EVERY event type you want tracked (Txn created, approved, rejected, reviewed, on hold, awaiting user, deleted) -- Sumsub only sends the ones you check:`)
       + `<br/><code class="copyline"><span>${s.webhook_url}</span><button onclick="copyToClipboard('${s.webhook_url}', this)">Copy</button></code>`
   });
+  if (s.webhook_signature_verification === "enabled") {
+    rows.push({icon: "good", text: `<strong>Webhook signature verification is on.</strong> Every incoming POST to the webhook URL is checked against SUMSUB_WEBHOOK_SECRET_KEY before being trusted -- forged/unauthenticated requests are rejected with HTTP 401 and never touch your data.${s.webhook_invalid_signature_count ? ` <strong style="color:var(--status-critical);">${s.webhook_invalid_signature_count} invalid-signature attempt(s) blocked so far</strong> -- check Sumsub's Webhook logs to confirm this matches Sumsub's own delivery attempts (mismatches here usually mean the secret in Render doesn't match the one currently shown in Sumsub's Webhook manager).` : ""}`});
+  } else {
+    rows.push({icon: "warn", text: `<strong>Webhook signature verification is off.</strong> Any POST to the webhook URL below is currently accepted at face value -- there's no way to tell a real Sumsub event from anyone else who finds this URL. Copy the secret key shown in Sumsub Dashboard &rarr; Webhook manager (when you create or edit the webhook) into Render's Environment tab as <code>SUMSUB_WEBHOOK_SECRET_KEY</code> and redeploy -- never paste it into chat or commit it to code, same as the API credentials. Sumsub signs each request with <code>x-payload-digest</code> / <code>X-Payload-Digest-Alg</code> headers; this bot verifies them the moment that variable is set, no other change needed.`});
+  }
+  if (s.auto_backfill && s.auto_backfill.attempted) {
+    rows.push({icon: "warn", text: `<strong>Auto-recovering from an empty database.</strong> ${s.auto_backfill.reason} This can take a few minutes -- refresh this page to see progress, or check the "Run full historical backfill" panel below.`});
+  }
+  if (s.webhook_missing_txn_created) {
+    rows.push({icon: "warn", text: `<strong>Webhook events are arriving, but never "applicantKytTxnCreated"</strong> -- the specific event Sumsub sends the moment a brand-new transaction is first created. Sumsub only sends event types you've explicitly enabled in <strong>Dashboard &rarr; Webhook manager</strong>; without this one, new transactions won't show up here in real time until some later event (review/approval/rejection) happens to fire instead. Edit the webhook in Sumsub's dashboard and make sure the "Txn created" event type is checked. Event types actually seen so far: ${(s.webhook_event_types||[]).map(e => `<span class="pill">${e.event_type} &times;${e.count}</span>`).join(" ") || "none"}.`});
+  }
+  if (s.db_likely_ephemeral && s.total_transactions > 0) {
+    rows.push({icon: "warn", text: `<strong>No persistent disk detected</strong> (db path: <code>${s.db_path}</code>). On Render's Free/Starter plans this file resets on every restart/redeploy, so the counts below can drop back to 0 after a deploy even though nothing is broken -- the bot just auto-refills via a historical backfill on the next startup (see above) or as new webhook events arrive. Add a Render Disk mounted at <code>/data</code> with <code>BOT_DB_PATH=/data/bank_rfi_bot.db</code> to stop this from happening -- see the README's "Deploying on Render" section.`});
+  }
   if (s.total_transactions === 0) {
     rows.push({icon: "warn", text: `<strong>No data yet.</strong> All data comes straight from the Sumsub API -- run "Run full historical backfill" below to pull your account's full transaction history, wait for new events to arrive via the webhook above, or use "Import transactions by ID" for a specific list.`});
   } else if (s.total_bank_rfi === 0) {
-    rows.push({icon: "warn", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested, but none tagged "${s.bank_rfi_tag}" yet.</strong> If you know some already carry that tag in Sumsub, use "Import transactions by ID" below -- filter by "${s.bank_rfi_tag}" in the Sumsub Dashboard, copy the IDs it shows, and paste them there. Sumsub's API has no way to list transactions by tag (or at all) on its own, so this is the fastest way in.`});
+    rows.push({icon: "warn", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested, but none tagged "${s.bank_rfi_tag}" yet.</strong> If you know some already carry that tag in Sumsub, use "Import transactions by ID" below -- filter by "${s.bank_rfi_tag}" in the Sumsub Dashboard, copy the IDs it shows, and paste them there. Sumsub's API has no way to list transactions by tag (or at all) on its own, so this is the fastest way in. Check "What distinguishes bank-rfi transactions" further down the page -- it lists every raw tag label actually seen so far, so you can immediately spot if Sumsub's real tag spelling differs from "${s.bank_rfi_tag}".`});
   } else {
     rows.push({icon: "good", text: `<strong>${s.total_transactions.toLocaleString()} transaction(s) ingested</strong>, ${s.total_bank_rfi.toLocaleString()} tagged "${s.bank_rfi_tag}" so far -- all pulled from the Sumsub API. The model retrains immediately every time a webhook event comes in (not on a timer); a safety-net sweep also runs every ${s.ingest_interval_minutes} minute(s) in case any webhook delivery was missed.`});
   }
   const allGood = s.connection_status === "ok" && s.total_transactions > 0;
   banner.style.display = "block";
   banner.innerHTML = `<h2>${allGood ? "Status" : "Setup"}</h2>${rows.map(r => `<div class="setup-row"><span class="setup-icon ${r.icon}">${r.icon === "good" ? "&#10003;" : "!"}</span><span>${r.text}</span></div>`).join("")}`;
+  renderRawTagsDiag(s.distinct_tags_seen || [], s.bank_rfi_tag);
+}
+
+function renderRawTagsDiag(tags, expectedTag) {
+  const el = document.getElementById("rawTagsDiag");
+  if (!el) return;
+  if (!tags.length) {
+    el.innerHTML = '<p class="empty">No tags seen on any ingested transaction yet.</p>';
+    return;
+  }
+  el.innerHTML = `
+    <p class="desc" style="margin-bottom:6px;"><strong>Every raw tag label seen so far</strong> (diagnostic -- compare against the expected tag "${expectedTag}" below; a mismatched spelling/separator here is the fastest way to spot why a transaction you know is tagged isn't counted as bank-rfi).</p>
+    <div>${tags.map(t => `<span class="pill" style="${t.matches_bank_rfi ? 'border-color:var(--status-good);color:var(--status-good);' : ''}">${t.tag} &times;${t.count}${t.matches_bank_rfi ? ' (matches)' : ''}</span>`).join(" ")}</div>
+  `;
 }
 
 function renderTiles(s) {
+  const aucVal = (typeof s.model_cv_roc_auc === "number") ? s.model_cv_roc_auc.toFixed(3) : "–";
+  const modeSub = s.model_mode === "ml"
+    ? (typeof s.model_cv_roc_auc === "number" ? `cross-validated AUC ${aucVal} (0.5=random, 1.0=perfect)` : "trained " + (s.model_trained_at||""))
+    : (s.model_heuristic_reason || (s.model_trained_at ? ("trained " + s.model_trained_at) : "not trained yet"));
   const tiles = [
     {label: "Transactions scanned", value: fmt(s.total_transactions)},
     {label: "Tagged “bank rfi”", value: fmt(s.total_bank_rfi)},
     {label: "Candidates since last RFI", value: fmt(s.candidate_transactions),
      sub: s.last_bank_rfi_at ? ("since " + s.last_bank_rfi_at.slice(0, 16).replace("T", " ")) : "no bank-rfi tag seen yet"},
-    {label: "Model mode", value: s.model_mode || "untrained", sub: s.model_trained_at ? ("trained " + s.model_trained_at) : "not trained yet"},
+    {label: "Model mode", value: s.model_mode || "untrained", sub: modeSub},
   ];
   document.getElementById("tiles").innerHTML = tiles.map(t => `<div class="tile"><div class="label">${t.label}</div><div class="value">${t.value}</div>${t.sub ? `<div class="sub">${t.sub}</div>` : ""}</div>`).join("");
   if (!window._importAutoOpened) {
@@ -2317,7 +2427,11 @@ document.querySelectorAll("#predTable th[data-key]").forEach(th => {
 
 function renderHistory(versions) {
   const body = document.getElementById("historyBody");
-  body.innerHTML = versions.length ? versions.map(v => `<tr><td>${v.trained_at}</td><td>${v.mode}</td><td>${v.n_bank_rfi}</td><td>${v.n_other}</td></tr>`).join("") : '<tr><td colspan="4" class="empty">No trained model versions yet.</td></tr>';
+  body.innerHTML = versions.length ? versions.map(v => {
+    const m = v.metrics_json || {};
+    const auc = (typeof m.cv_roc_auc === "number") ? m.cv_roc_auc.toFixed(3) : (v.mode === "ml" ? "–" : "n/a (heuristic)");
+    return `<tr><td>${v.trained_at}</td><td>${v.mode}</td><td>${v.n_bank_rfi}</td><td>${v.n_other}</td><td>${fmt(m.n_excluded_open_pending)}</td><td>${auc}</td></tr>`;
+  }).join("") : '<tr><td colspan="6" class="empty">No trained model versions yet.</td></tr>';
 }
 
 document.getElementById("refreshBtn").addEventListener("click", async (e) => {
