@@ -12,6 +12,24 @@ retrains the instant a webhook event comes in from Sumsub, so the risk
 picture stays current within seconds of something changing on your account,
 not on a schedule.
 
+## Contents
+
+- [What it actually does](#what-it-actually-does)
+- [Repo layout](#repo-layout)
+- [Quick start](#quick-start)
+- [Credentials](#credentials)
+- [How data gets in](#how-data-gets-in)
+- [How the model works](#how-the-model-works)
+- [The dashboard](#the-dashboard)
+- [Deploying on Render](#deploying-on-render)
+- [Environment variables reference](#environment-variables-reference)
+- [Running it locally](#running-it-locally)
+- [Trying it before real Sumsub data is connected](#trying-it-before-real-sumsub-data-is-connected)
+- [Securing the webhook](#securing-the-webhook)
+- [Security notes](#security-notes)
+- [API reference](#api-reference)
+- [Troubleshooting](#troubleshooting)
+
 ## What it actually does
 
 Every transaction the bot ever learns from was fetched from the real Sumsub
