@@ -12,6 +12,24 @@ retrains the instant a webhook event comes in from Sumsub, so the risk
 picture stays current within seconds of something changing on your account,
 not on a schedule.
 
+## Contents
+
+- [What it actually does](#what-it-actually-does)
+- [Repo layout](#repo-layout)
+- [Quick start](#quick-start)
+- [Credentials](#credentials)
+- [How data gets in](#how-data-gets-in)
+- [How the model works](#how-the-model-works)
+- [The dashboard](#the-dashboard)
+- [Deploying on Render](#deploying-on-render)
+- [Environment variables reference](#environment-variables-reference)
+- [Running it locally](#running-it-locally)
+- [Trying it before real Sumsub data is connected](#trying-it-before-real-sumsub-data-is-connected)
+- [Securing the webhook](#securing-the-webhook)
+- [Security notes](#security-notes)
+- [API reference](#api-reference)
+- [Troubleshooting](#troubleshooting)
+
 ## What it actually does
 
 Every transaction the bot ever learns from was fetched from the real Sumsub
@@ -234,12 +252,47 @@ name — enough for a reviewer to go pull up the actual matching cases.
 **Feature set.** Amount and log-amount, direction, currency, transaction
 type, counterparty country (with a static high-risk-country flag),
 round-amount and near-reporting-threshold flags, and applicant-history
-features (prior transaction count, prior "bank rfi" rate, transaction
-velocity in 24h/7d windows, amount relative to the applicant's own
-historical average). Categorical features are one-hot encoded and capped
-to the 12 most frequent values per feature (`MAX_CATEGORICAL_VOCAB`) so a
-high-cardinality field like counterparty country can't blow up the feature
-space relative to a small number of positive examples.
+features (prior transaction count, transaction velocity in 24h/7d windows,
+amount relative to the applicant's own historical average). Categorical
+features are one-hot encoded and capped to the 12 most frequent values per
+feature (`MAX_CATEGORICAL_VOCAB`) so a high-cardinality field like
+counterparty country can't blow up the feature space relative to a small
+number of positive examples. Counterparty country is read from
+`data.counterparty.residenceCountry` (confirmed against Sumsub's real API
+response shape, which returns ISO alpha-3 codes like `"RUS"`/`"DEU"`) —
+the high-risk-country list checks both alpha-2 and alpha-3 forms so it
+matches regardless of which shows up.
+
+**The "bank rfi" tag itself is training/testing ground truth only — it is
+never a model input.** `is_bank_rfi` is the label (`y`) that
+`train_model()` learns from and that cross-validated ROC-AUC is scored
+against; it never appears inside the feature vector the classifier
+actually reads. An earlier version violated this without realizing it: it
+counted how many of an applicant's *past* transactions were tagged "bank
+rfi" and fed that count/rate in as a feature, and even surfaced "this
+applicant already has an X% bank-rfi rate" as a match reason. That let the
+bot shortcut to "flag it because it (or this applicant) was flagged
+before" instead of learning the actual behavioral signals — amount,
+timing, velocity, counterparty risk, structuring — that make a transaction
+look like a bank RFI, and it meant a first-time applicant with a risky
+profile but zero tag history could never score above ~0%. Both the feature
+and the reason string have been removed, `server.py` now asserts at import
+time that no feature name in `NUMERIC_FEATURES`/`CATEGORICAL_FEATURES`
+contains `bank_rfi`/`is_rfi`/`_tag` (so this can't silently regress), and
+the model instead learns which *behaviors* — not which tag history — the
+confirmed "bank rfi" examples have in common, then applies that purely to
+each new transaction's own behavior in real time.
+
+**Every prediction is logged, not just computed and discarded.** After
+every retrain, the current score for every open candidate is written to a
+`predictions_log` table (skipping a re-write if a transaction's score
+hasn't materially changed since its last logged value, so this doesn't
+grow by every-candidate-times-every-retrain when most scores are stable).
+`GET /api/predictions/history/{txn_id}` answers "when did the model start
+flagging this and how did the score move over time" for any transaction,
+and `GET /api/predictions/log` shows the most recent scoring activity
+across the whole account — a durable audit trail independent of whatever
+`/api/predictions` happens to compute live right now.
 
 ## The dashboard
 
@@ -384,23 +437,34 @@ the public URL.
 
 - `GET /` — the dashboard
 - `GET /api/setup` — live credential check, webhook receipt + event-type
-  breakdown, signature verification status, database persistence check,
-  raw-tag diagnostics
+  breakdown, signature verification status (including per-type failure
+  detection), database persistence check, raw-tag and review-status
+  diagnostics, and the last 15 webhook requests in detail
 - `GET /api/health` — basic liveness check
 - `GET /api/summary` — headline counts, model status, cross-validated AUC
 - `GET /api/patterns` — statistical findings + plain-English narrative
 - `GET /api/predictions` — ranked open transactions with risk score,
-  reasons, and similar past cases
+  reasons, and similar past cases (live, computed on request)
+- `GET /api/predictions/log?limit=50` — recently logged prediction
+  snapshots across all transactions (see
+  [How the model works](#how-the-model-works))
+- `GET /api/predictions/history/{txn_id}` — one transaction's risk score
+  over time, across every retrain that changed it
 - `GET /api/transactions/{id}` — one transaction's stored record
 - `GET /api/model/history` — every retrain, with example counts and AUC,
   for audit purposes
+- `GET /api/webhooks/recent?limit=25` — the last N webhook requests with
+  event type, signature result, and ingestion outcome (same data
+  powering the dashboard's "Recent webhook activity" panel)
 - `POST /api/ingest/run` — trigger an on-demand safety-net ingestion +
   retrain cycle
 - `POST /api/ingest/import-ids` — start a background bulk import of
   specific transaction IDs (`{"txn_ids": [...]}` or free-form pasted text)
 - `GET /api/ingest/import-status` — poll progress of a running bulk import
-- `POST /api/ingest/backfill-history?months_back=60` — start a background
-  deep historical crawl of the full account history
+- `POST /api/ingest/backfill-history?months_back=60&exhaustive=false` —
+  start a background deep historical crawl of the full account history;
+  `exhaustive=true` disables the early-stop-on-empty-months heuristic to
+  guarantee every month in range is scanned
 - `GET /api/ingest/backfill-history-status` — poll progress of a running
   historical backfill
 - `POST /api/webhooks/sumsub` — Sumsub webhook receiver (see
@@ -412,13 +476,19 @@ the public URL.
 the ephemeral-storage issue described in
 [Deploying on Render](#deploying-on-render) — check `db_likely_ephemeral`
 on the Setup panel, and whether it says it's auto-recovering. Add a
-persistent disk to stop this from recurring.
+persistent disk to stop this from recurring, or run a full backfill with
+`exhaustive=true` if the auto-recovery's fast default missed older data.
 
 **New transactions aren't showing up as candidates in real time.** Check
-`GET /api/setup` → `webhook_event_types` for whether
-`applicantKytTxnCreated` has ever arrived — see
-[How data gets in](#how-data-gets-in). If it's missing, enable it in
-Sumsub's Webhook manager.
+the **"Recent webhook activity"** panel on the dashboard first — it shows
+the last 15 requests with their event type, signature result, and whether
+ingestion succeeded, which is the fastest way to see exactly where things
+are breaking. Then check `GET /api/setup` → `webhook_event_types` for
+whether `applicantKytTxnCreated` has ever arrived at all — see
+[How data gets in](#how-data-gets-in). If it's missing entirely, enable it
+in Sumsub's Webhook manager. If it's arriving but every single one fails
+signature verification (`webhook_types_fully_sig_failing` on the Setup
+panel), see the 401 entry below instead — that's a different problem.
 
 **A transaction you know is tagged isn't counted as "bank rfi."** Check
 "Every raw tag label seen so far" on the dashboard (inside "What
@@ -427,14 +497,30 @@ returning, and compare it against `BANK_RFI_TAG`. Matching is already
 case/separator-insensitive, so this usually means the label is genuinely
 different, not just differently formatted.
 
-**Webhook events are arriving but nothing gets ingested.** Check the
-Setup panel's event-type breakdown for `(N ingested)` per type — if it's
-consistently 0, the transaction fetch itself is failing (check server logs
-for the specific Sumsub error) rather than the webhook delivery.
+**Risk scores sit at 0% for everything, even transactions that should
+obviously be flagged.** This is almost always about confirmed *negative*
+examples, not positive ones: the model needs some transactions whose
+review has actually **concluded** without the "bank rfi" tag to know what
+"not risky" looks like (see [How the model works](#how-the-model-works)) —
+having plenty of confirmed bank-rfi examples doesn't help if there's
+nothing confirmed-clean to contrast them against. Check "Every
+review_status value actually seen so far" (also inside "What distinguishes
+bank-rfi transactions") — if almost everything shows as "open — excluded,"
+that's the answer, and it resolves itself as more transactions finish
+review on Sumsub. If review_status shows up as `(none/missing)` for
+transactions you know have concluded, that's a real extraction bug worth
+reporting, not a data-volume issue.
+
+**Webhook events are arriving but nothing gets ingested.** Check "Recent
+webhook activity" for the specific error under "Detail" for each event —
+it names the exact Sumsub error (a 404, a permissions error, a network
+issue) rather than just "failed."
 
 **401s on the webhook after setting `SUMSUB_WEBHOOK_SECRET_KEY`.** The
 value in Render must exactly match what's currently shown in Sumsub's
 Webhook manager for that webhook — if you regenerated the secret on
 Sumsub's side without updating Render (or vice versa), every request will
-fail signature verification. The Setup panel's invalid-signature counter
-will confirm attempts are arriving even while they're being rejected.
+fail signature verification. Check `webhook_types_fully_sig_failing` on the
+Setup panel (or "Recent webhook activity" directly) — if a real, expected
+event type shows there, Sumsub's delivery is fine and this is purely a
+secret mismatch to fix on one side or the other.
