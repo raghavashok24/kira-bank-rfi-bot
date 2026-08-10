@@ -337,8 +337,14 @@ CREATE TABLE IF NOT EXISTS model_versions (
 CREATE TABLE IF NOT EXISTS webhook_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     received_at TEXT DEFAULT CURRENT_TIMESTAMP, event_type TEXT, kyt_txn_id TEXT,
-    raw_json TEXT, processed INTEGER DEFAULT 0, process_detail TEXT
+    raw_json TEXT, processed INTEGER DEFAULT 0, process_detail TEXT, signature_detail TEXT
 );
+
+CREATE TABLE IF NOT EXISTS predictions_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at TEXT DEFAULT CURRENT_TIMESTAMP, txn_id TEXT, risk_score REAL, mode TEXT, reasons_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_predictions_log_txn ON predictions_log(txn_id);
 """
 
 # Sumsub's documented reviewStatus values (docs.sumsub.com/docs/transaction-
@@ -361,6 +367,8 @@ def init_db():
         wh_cols = {r["name"] for r in conn.execute("PRAGMA table_info(webhook_events)").fetchall()}
         if "process_detail" not in wh_cols:
             conn.execute("ALTER TABLE webhook_events ADD COLUMN process_detail TEXT")
+        if "signature_detail" not in wh_cols:
+            conn.execute("ALTER TABLE webhook_events ADD COLUMN signature_detail TEXT")
 
 
 @contextmanager
@@ -429,6 +437,31 @@ def distinct_raw_tags(transactions: list[dict] | None = None) -> list[dict]:
         for tag, count in counts.items()
     ]
     out.sort(key=lambda r: (-r["count"], r["tag"]))
+    return out
+
+
+def distinct_review_statuses(transactions: list[dict] | None = None) -> list[dict]:
+    """Every distinct review_status value actually extracted from ingested
+    transactions, with counts and whether it currently counts as "open"
+    (excluded from training as a negative example -- see OPEN_STATUSES and
+    train_model's docstring) or "resolved" (eligible). This exists for the
+    same reason distinct_raw_tags does: training eligibility now depends
+    entirely on correctly reading this field out of Sumsub's real API
+    response (confirmed nested at review.reviewStatus, per
+    docs.sumsub.com/reference/get-transaction), and if that extraction is
+    ever wrong for a real account's data shape, this is where it would show
+    up as "every transaction has review_status=None (or some unexpected
+    value)" instead of silently producing a model that never leaves
+    heuristic mode with zero pattern findings."""
+    txns = transactions if transactions is not None else all_transactions()
+    counts: dict[str, int] = {}
+    for t in txns:
+        status = t.get("review_status")
+        key = status if status not in (None, "") else "(none/missing)"
+        counts[key] = counts.get(key, 0) + 1
+    out = [{"review_status": k, "count": v, "counts_as_open": (k if k != "(none/missing)" else None) in OPEN_STATUSES}
+           for k, v in counts.items()]
+    out.sort(key=lambda r: -r["count"])
     return out
 
 
@@ -538,13 +571,28 @@ def model_version_history(limit=50) -> list[dict]:
         return out
 
 
-def record_webhook_event(event_type: str, kyt_txn_id: str, raw_json: dict) -> int:
+def record_webhook_event(event_type: str, kyt_txn_id: str, raw_json: dict, signature_detail: str = "") -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO webhook_events (event_type, kyt_txn_id, raw_json) VALUES (?,?,?)",
-            (event_type, kyt_txn_id, json.dumps(raw_json)),
+            "INSERT INTO webhook_events (event_type, kyt_txn_id, raw_json, signature_detail) VALUES (?,?,?,?)",
+            (event_type, kyt_txn_id, json.dumps(raw_json), signature_detail),
         )
         return cur.lastrowid
+
+
+def recent_webhook_events(limit: int = 25) -> list[dict]:
+    """Per-event detail (not just aggregate counts) for the dashboard's
+    "recent webhook activity" diagnostic -- this is what turns "the webhook
+    isn't updating" from a guess into something inspectable: for each of the
+    last N requests to /api/webhooks/sumsub, exactly what type it was, what
+    the signature check said (present/absent/valid/invalid), and whether
+    ingestion actually succeeded or why not."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, received_at, event_type, kyt_txn_id, processed, process_detail, signature_detail "
+            "FROM webhook_events ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def mark_webhook_event_processed(row_id: int, ok: bool, detail: str = ""):
@@ -555,36 +603,64 @@ def mark_webhook_event_processed(row_id: int, ok: bool, detail: str = ""):
         )
 
 
-def webhook_event_count(exclude_invalid_signature: bool = True) -> int:
+def webhook_event_count(exclude_unrecognized: bool = True) -> int:
+    """Counts real Sumsub events received. By default excludes the two
+    synthetic bucket labels used for requests that weren't a recognizable
+    Sumsub payload at all (couldn't be parsed as JSON, or had no
+    "type"/txn id and failed signature check) -- a request that DID parse
+    as a real Sumsub event but failed signature verification still counts
+    here (under its real event type), since Sumsub genuinely sent it; see
+    webhook_event_type_breakdown's sig_failed_count for that distinction."""
     with get_conn() as conn:
-        if exclude_invalid_signature:
+        if exclude_unrecognized:
             return conn.execute(
-                "SELECT COUNT(*) c FROM webhook_events WHERE event_type != 'invalid_signature'"
+                "SELECT COUNT(*) c FROM webhook_events WHERE event_type NOT IN ('invalid_signature', 'invalid_json')"
             ).fetchone()["c"]
         return conn.execute("SELECT COUNT(*) c FROM webhook_events").fetchone()["c"]
 
 
+def _signature_failed(detail: str | None) -> bool:
+    """signature_detail is a free-text explanation (see
+    verify_webhook_signature), not a boolean column, so this is the one
+    place that interprets it: anything other than "verified" or
+    "disabled" (no secret configured, so nothing to fail) counts as a
+    failure -- missing headers, unsupported algorithm, or a mismatch."""
+    d = (detail or "").lower()
+    return not d.startswith("signature verified") and "disabled" not in d
+
+
 def webhook_event_type_breakdown(hours: int = 24 * 14) -> list[dict]:
     """Every distinct Sumsub event `type` actually received in the last
-    `hours`, with counts and how many of each resulted in a real
-    ingest-and-retrain. This is THE diagnostic for "the webhook isn't firing
-    for every new transaction" -- Sumsub only sends event types you've
-    explicitly enabled in Dashboard -> Webhook manager (see
-    docs.sumsub.com/docs/transaction-monitoring-webhooks), and the event
-    that fires when a transaction is FIRST created is a specific type
-    (applicantKytTxnCreated) distinct from review-outcome events like
-    applicantKytTxnApproved/Rejected/Reviewed. If that type never appears
-    here, new transactions aren't reaching this bot in real time no matter
-    how correct the code is -- the fix is enabling it on Sumsub's side, not
-    a code change."""
+    `hours`, with counts, how many of each resulted in a real
+    ingest-and-retrain, and how many failed SIGNATURE verification
+    specifically. This is THE diagnostic for "the webhook isn't firing for
+    every new transaction" -- and it separates two very different failure
+    modes that look identical from Sumsub's side (both show as a failed
+    delivery):
+      - The event type simply never appears here at all -> Sumsub isn't
+        sending it -- enable it in Dashboard -> Webhook manager (see
+        docs.sumsub.com/docs/transaction-monitoring-webhooks). The event
+        that fires when a transaction is FIRST created is a specific type
+        (applicantKytTxnCreated), distinct from review-outcome events.
+      - The event type DOES appear, with a real count, but sig_failed_count
+        equals count (everything of that type is failing signature check)
+        -> Sumsub IS sending it, but SUMSUB_WEBHOOK_SECRET_KEY in Render
+        doesn't match the secret currently shown in Sumsub's Webhook
+        manager for this webhook -- a code/config mismatch, not a Sumsub-
+        side delivery problem."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT event_type, COUNT(*) c, SUM(processed) processed_c FROM webhook_events "
-            "WHERE received_at >= ? GROUP BY event_type ORDER BY c DESC",
+            "SELECT event_type, processed, signature_detail FROM webhook_events WHERE received_at >= ?",
             (cutoff,),
         ).fetchall()
-        return [{"event_type": r["event_type"], "count": r["c"], "processed_count": r["processed_c"] or 0} for r in rows]
+    agg: dict[str, dict] = {}
+    for r in rows:
+        bucket = agg.setdefault(r["event_type"], {"event_type": r["event_type"], "count": 0, "processed_count": 0, "sig_failed_count": 0})
+        bucket["count"] += 1
+        bucket["processed_count"] += 1 if r["processed"] else 0
+        bucket["sig_failed_count"] += 1 if _signature_failed(r["signature_detail"]) else 0
+    return sorted(agg.values(), key=lambda b: -b["count"])
 
 
 def delete_transaction(txn_id: str):
@@ -592,12 +668,75 @@ def delete_transaction(txn_id: str):
         conn.execute("DELETE FROM transactions WHERE txn_id=?", (txn_id,))
 
 
+def log_predictions(scored: list[dict]):
+    """Persists a snapshot of every currently-scored candidate transaction
+    into predictions_log -- so "every newly predicted transaction" leaves a
+    durable, queryable record instead of being computed fresh and discarded
+    on every dashboard load. Called after every retrain (see retrain_only),
+    so a compliance reviewer can later answer "what did the model think
+    about this transaction, and when did that change" via
+    GET /api/predictions/history/{txn_id}, not just "what does it think
+    right now." Skips re-inserting a row for a transaction whose score
+    hasn't meaningfully changed since its last logged entry, so this table
+    doesn't grow by (candidates x retrains) when most retrains don't
+    actually move most scores."""
+    if not scored:
+        return
+    with get_conn() as conn:
+        last_scores = dict(conn.execute(
+            "SELECT txn_id, risk_score FROM predictions_log WHERE id IN "
+            "(SELECT MAX(id) FROM predictions_log GROUP BY txn_id)"
+        ).fetchall())
+        rows = []
+        for s in scored:
+            prev = last_scores.get(s["txn_id"])
+            if prev is not None and abs(prev - s["risk_score"]) < 0.005:
+                continue
+            rows.append((s["txn_id"], s["risk_score"], s.get("mode"), json.dumps(s.get("reasons") or [])))
+        if rows:
+            conn.executemany(
+                "INSERT INTO predictions_log (txn_id, risk_score, mode, reasons_json) VALUES (?,?,?,?)", rows,
+            )
+
+
+def prediction_history(txn_id: str, limit: int = 50) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT logged_at, risk_score, mode, reasons_json FROM predictions_log "
+            "WHERE txn_id=? ORDER BY id DESC LIMIT ?", (txn_id, limit),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["reasons"] = json.loads(d.pop("reasons_json") or "[]")
+            out.append(d)
+        return out
+
+
+def recent_predictions_log(limit: int = 50) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT txn_id, logged_at, risk_score, mode FROM predictions_log ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 # ============================================================================
 # Feature engineering -- every feature here should be explainable in one
 # sentence to a compliance reviewer.
 # ============================================================================
 
-HIGH_RISK_COUNTRIES = {"IR", "KP", "SY", "AF", "MM", "VE", "RU", "BY"}
+# Both ISO alpha-2 AND alpha-3 forms of each country, because Sumsub's
+# confirmed real field for this (data.counterparty.residenceCountry, per
+# docs.sumsub.com/reference/get-transaction) returns alpha-3 codes ("RUS",
+# "BLR", "IRN"...), but alpha-2 is kept too in case any other source of this
+# value (a payment-method-specific field, a differently-shaped account) ever
+# supplies the shorter form -- comparison is done against whichever string
+# actually shows up, uppercased, so either form matches.
+HIGH_RISK_COUNTRIES = {
+    "IR", "IRN", "KP", "PRK", "SY", "SYR", "AF", "AFG",
+    "MM", "MMR", "VE", "VEN", "RU", "RUS", "BY", "BLR",
+}
 STRUCTURING_THRESHOLDS = [3000, 10000]
 CATEGORICAL_FEATURES = ["currency", "txn_type", "counterparty_country"]
 # Caps how many one-hot columns a single categorical feature can contribute.
@@ -720,7 +859,7 @@ def extract_features(row: dict, history_index: dict) -> dict:
 # Pattern analysis -- plain, auditable stats (no black box).
 # ============================================================================
 
-def analyze_patterns(bank_rfi_features: list[dict], other_features: list[dict]) -> dict:
+def analyze_patterns(bank_rfi_features: list[dict], other_features: list[dict], n_excluded_open: int = 0) -> dict:
     result = {
         "n_bank_rfi": len(bank_rfi_features), "n_other": len(other_features),
         "numeric_findings": [], "categorical_findings": [], "narrative": [],
@@ -729,6 +868,28 @@ def analyze_patterns(bank_rfi_features: list[dict], other_features: list[dict]) 
         result["narrative"].append(
             f'Only {len(bank_rfi_features)} transaction(s) tagged "bank rfi" so far -- too few to '
             "find statistically reliable patterns yet. The bot will keep re-analyzing as more come in."
+        )
+        return result
+    if len(other_features) < 3:
+        # This is a DIFFERENT limitation from "not enough bank-rfi examples"
+        # and needs its own message: it means every non-tagged transaction
+        # ingested so far is STILL OPEN/PENDING review (see train_model's
+        # docstring on why open transactions are excluded here) -- there's
+        # nothing yet to statistically contrast the bank-rfi examples
+        # against, even though bank-rfi examples themselves may be plenty.
+        # Without this message, a heuristic score of exactly 0% for every
+        # candidate looks identical to "the model is broken" when it's
+        # actually "the model has nothing confirmed to compare against yet."
+        open_note = (
+            f" ({n_excluded_open} transaction(s) are currently open/pending review and don't count "
+            "until their review actually concludes)" if n_excluded_open else ""
+        )
+        result["narrative"].append(
+            f"Only {len(other_features)} transaction(s) with a CONCLUDED review and no \"bank rfi\" tag "
+            f"exist yet{open_note} -- too few to know what \"not risky\" looks like, so risk scores will "
+            "sit near 0% for everyone regardless of how many bank-rfi examples exist. This resolves itself "
+            "automatically as more transactions finish review (approved/rejected/reviewed) on Sumsub -- "
+            "no action needed here, just more confirmed outcomes."
         )
         return result
 
@@ -907,7 +1068,7 @@ def train_model(transactions: list[dict]) -> ModelBundle:
     confirmed_other_feats = [f for f in feats if not f["_is_bank_rfi"] and not f["_is_open"]]
     excluded_open_feats = [f for f in feats if not f["_is_bank_rfi"] and f["_is_open"]]
     labeled_feats = bank_rfi_feats + confirmed_other_feats
-    pattern_findings = analyze_patterns(bank_rfi_feats, confirmed_other_feats)
+    pattern_findings = analyze_patterns(bank_rfi_feats, confirmed_other_feats, n_excluded_open=len(excluded_open_feats))
 
     vocab = {cat: _vocab_for(feats, cat) for cat in CATEGORICAL_FEATURES}
     feature_names = list(NUMERIC_FEATURES) + [f"{cat}={v}" for cat in CATEGORICAL_FEATURES for v in vocab[cat]]
@@ -1091,7 +1252,23 @@ def normalize_txn(raw: dict, tags: list[str], notes: list[dict] | None = None) -
         "amount": _dig(raw, "data.info.amount", "data.amount", "amount"),
         "currency": _dig(raw, "data.info.currencyCode", "data.currencyCode", "currency"),
         "txn_type": _dig(raw, "data.type", "type"),
-        "counterparty_country": _dig(raw, "data.counterparty.paymentMethod.country", "data.counterparty.country", "counterparty.country"),
+        # CONFIRMED against docs.sumsub.com/reference/get-transaction: the
+        # real field is data.counterparty.residenceCountry (ISO alpha-3,
+        # e.g. "RUS", "DEU"), NOT the paymentMethod.country / bare .country
+        # paths an earlier version of this guessed at without a confirmed
+        # source. Those guesses are kept as fallbacks (harmless if unused,
+        # in case a payment-method-specific country is ever present too),
+        # but residenceCountry is checked first since it's the one
+        # Sumsub's own docs confirm actually exists on this response.
+        # Getting this field wrong meant counterparty_country -- and the
+        # counterparty_high_risk flag derived from it -- silently sat at
+        # "unknown"/0 for every real transaction, which is a real chunk of
+        # the "why doesn't it flag anything" problem, not just a cosmetic
+        # gap.
+        "counterparty_country": _dig(
+            raw, "data.counterparty.residenceCountry", "data.counterparty.paymentMethod.country",
+            "data.counterparty.country", "counterparty.country",
+        ),
         "counterparty_id": _dig(raw, "data.counterparty.paymentMethod.accountId", "data.counterparty.id"),
         "counterparty_bank_name": _dig(
             raw, "data.counterparty.paymentMethod.bankName", "data.counterparty.paymentMethod.bank.name",
@@ -1610,6 +1787,16 @@ def retrain_only():
                 "Retrained model in %s mode on %d transactions (cv_roc_auc=%s)",
                 _current_bundle.mode, len(txns), _current_bundle.metrics.get("cv_roc_auc"),
             )
+            # Persist a snapshot of every currently-scored candidate so
+            # "every newly predicted transaction" leaves a durable record
+            # (see log_predictions) -- not just a number recomputed fresh
+            # on every dashboard load and thrown away.
+            try:
+                candidates = transactions_since_last_bank_rfi(txns)
+                scored = score_all_open(candidates, txns, _current_bundle)
+                log_predictions(scored)
+            except Exception:
+                logger.exception("Failed to log predictions snapshot (retrain itself succeeded)")
         else:
             logger.info("No transactions in the database yet -- nothing to train on.")
     except Exception:
@@ -1731,10 +1918,19 @@ def api_setup(request: Request):
     txns = all_transactions()
     base = str(request.base_url).rstrip("/")
     tag_diagnostics = distinct_raw_tags(txns)
+    review_status_diagnostics = distinct_review_statuses(txns)
     event_types = webhook_event_type_breakdown()
-    seen_types = {e["event_type"] for e in event_types}
-    invalid_sig_count = next((e["count"] for e in event_types if e["event_type"] == "invalid_signature"), 0)
-    real_event_types = [e for e in event_types if e["event_type"] != "invalid_signature"]
+    real_event_types = [e for e in event_types if e["event_type"] not in ("invalid_signature", "invalid_json")]
+    seen_real_types = {e["event_type"] for e in real_event_types}
+    invalid_sig_count = sum(e["sig_failed_count"] for e in event_types)
+    # A real, recognized Sumsub event type where EVERY occurrence failed
+    # signature verification is the specific "wrong secret" signature --
+    # distinct from a type simply never showing up at all (see
+    # webhook_event_type_breakdown's docstring).
+    types_fully_sig_failing = [e["event_type"] for e in real_event_types if e["count"] > 0 and e["sig_failed_count"] == e["count"]]
+    rfi_count = len([t for t in txns if t["is_bank_rfi"]])
+    n_confirmed_other = len([t for t in txns if not t["is_bank_rfi"] and t.get("review_status") not in OPEN_STATUSES])
+    n_still_open = len(txns) - rfi_count - n_confirmed_other
     return {
         "credentials_configured": conn["status"] != "not_configured",
         "connection_status": conn["status"],
@@ -1742,17 +1938,22 @@ def api_setup(request: Request):
         "webhook_url": f"{base}/api/webhooks/sumsub",
         "webhook_events_received": webhook_event_count(),
         "webhook_event_types": real_event_types,
-        "webhook_missing_txn_created": bool(real_event_types) and "applicantKytTxnCreated" not in seen_types,
+        "webhook_missing_txn_created": bool(real_event_types) and "applicantKytTxnCreated" not in seen_real_types,
         "webhook_signature_verification": "enabled" if SUMSUB_WEBHOOK_SECRET_KEY else "disabled_no_secret",
         "webhook_invalid_signature_count": invalid_sig_count,
+        "webhook_types_fully_sig_failing": types_fully_sig_failing,
         "total_transactions": len(txns),
-        "total_bank_rfi": len([t for t in txns if t["is_bank_rfi"]]),
+        "total_bank_rfi": rfi_count,
+        "total_confirmed_other": n_confirmed_other,
+        "total_still_open_pending": n_still_open,
         "bank_rfi_tag": BANK_RFI_TAG,
         "ingest_interval_minutes": INGEST_INTERVAL_MINUTES,
         "db_path": DB_PATH,
         "db_likely_ephemeral": _db_likely_ephemeral(),
         "distinct_tags_seen": tag_diagnostics,
+        "distinct_review_statuses_seen": review_status_diagnostics,
         "auto_backfill": dict(_startup_auto_backfill),
+        "recent_webhook_events": recent_webhook_events(15),
     }
 
 
@@ -1829,6 +2030,37 @@ def api_model_history():
     return {"versions": model_version_history()}
 
 
+@app.get("/api/predictions/log")
+def api_predictions_log(limit: int = 50):
+    """Every logged prediction snapshot across all transactions, most
+    recent first -- see log_predictions (called from retrain_only). This is
+    the durable record of "every newly predicted transaction," independent
+    of the live /api/predictions computation."""
+    return {"entries": recent_predictions_log(limit)}
+
+
+@app.get("/api/predictions/history/{txn_id}")
+def api_prediction_history(txn_id: str):
+    """One transaction's risk score over time, across every retrain that
+    produced a materially different score for it -- lets a reviewer answer
+    "when did the model start flagging this" instead of only "what does it
+    say right now." """
+    history = prediction_history(txn_id)
+    if not history:
+        return JSONResponse({"error": "No logged predictions for this transaction yet."}, status_code=404)
+    return {"txn_id": txn_id, "history": history}
+
+
+@app.get("/api/webhooks/recent")
+def api_webhooks_recent(limit: int = 25):
+    """Per-event detail for the last N webhook requests -- event type,
+    whether ingestion succeeded and why not if it didn't, and the signature
+    verification detail. The primary diagnostic for "the webhook isn't
+    updating": distinguishes Sumsub not sending an event type at all from
+    Sumsub sending it but the bot rejecting/failing to process it."""
+    return {"events": recent_webhook_events(limit)}
+
+
 @app.post("/api/ingest/run")
 def api_trigger_ingest():
     run_ingest_and_retrain()
@@ -1898,12 +2130,19 @@ def api_import_status():
     return {**_import_job, "summary": api_summary() if not _import_job["running"] else None}
 
 
-def _run_backfill_history_job_in_background(client: SumsubClient, months_back: int):
+def _run_backfill_history_job_in_background(client: SumsubClient, months_back: int, exhaustive: bool = False):
     def on_progress(done, total):
         _backfill_history_job["months_done"] = done
         _backfill_history_job["months_total"] = total
     try:
-        result = run_deep_historical_backfill(client, months_back=months_back, on_progress=on_progress)
+        # exhaustive=True sets max_empty_months to months_back itself, i.e.
+        # the empty-streak early-stop can never trip -- every month in the
+        # range gets scanned regardless of how many consecutive empty
+        # months precede it. Slower (and issues more Sumsub API calls) but
+        # guarantees "every past transaction in range", which is what the
+        # early-stop heuristic explicitly trades away for speed by default.
+        max_empty = months_back if exhaustive else 18
+        result = run_deep_historical_backfill(client, months_back=months_back, max_empty_months=max_empty, on_progress=on_progress)
         retrain_only()
         _backfill_history_job["result"] = result
     except Exception as e:  # noqa: BLE001 - must not wedge the job state
@@ -1915,11 +2154,19 @@ def _run_backfill_history_job_in_background(client: SumsubClient, months_back: i
 
 
 @app.post("/api/ingest/backfill-history")
-def api_backfill_history(background_tasks: BackgroundTasks, months_back: int = 60):
+def api_backfill_history(background_tasks: BackgroundTasks, months_back: int = 60, exhaustive: bool = False):
     """Trigger a ONE-TIME deep historical crawl covering every transaction
     type (see run_deep_historical_backfill) -- not part of the automatic
     hourly cycle, which only checks a short recent window to stay fast.
-    Runs in the background; poll GET /api/ingest/backfill-history-status."""
+    Runs in the background; poll GET /api/ingest/backfill-history-status.
+
+    By default this stops early after 18 consecutive months with zero
+    transactions found (a proxy for "before the account existed"), to avoid
+    burning through months of API calls for an account that's newer than
+    `months_back`. Pass `exhaustive=true` to disable that early-stop and
+    scan every single month in range regardless of empty streaks -- slower,
+    but guarantees literally every past transaction in the window gets a
+    chance to be found, for accounts with genuine multi-year quiet gaps."""
     client = get_client()
     if client is None:
         return JSONResponse(
@@ -1933,8 +2180,8 @@ def api_backfill_history(background_tasks: BackgroundTasks, months_back: int = 6
         )
     _backfill_history_job.update(running=True, months_done=0, months_total=months_back, result=None,
                                   started_at=datetime.now(timezone.utc).isoformat(), finished_at=None)
-    background_tasks.add_task(_run_backfill_history_job_in_background, client, months_back)
-    return {"status": "started", "months_back": months_back}
+    background_tasks.add_task(_run_backfill_history_job_in_background, client, months_back, exhaustive)
+    return {"status": "started", "months_back": months_back, "exhaustive": exhaustive}
 
 
 @app.get("/api/ingest/backfill-history-status")
@@ -2014,24 +2261,38 @@ async def api_sumsub_webhook(request: Request, background_tasks: BackgroundTasks
     is_valid, sig_detail = verify_webhook_signature(
         raw_body, request.headers.get("x-payload-digest"), request.headers.get("x-payload-digest-alg"),
     )
-    if not is_valid:
-        logger.warning("Rejected webhook POST with invalid signature: %s", sig_detail)
-        record_webhook_event("invalid_signature", "unknown", {"detail": sig_detail})
-        return JSONResponse({"error": "invalid signature", "detail": sig_detail}, status_code=401)
-
+    # Best-effort parse even on a failed signature check -- a MISCONFIGURED
+    # secret (wrong value in Render vs. what's currently shown in Sumsub's
+    # Webhook manager) still sends a real, well-formed Sumsub payload that
+    # just fails the HMAC compare; recording its real event type/txn id
+    # (instead of collapsing everything into one "invalid_signature" bucket
+    # with no other detail) makes that failure mode distinguishable from an
+    # actual forged/garbage request in the recent-events diagnostic.
     try:
         event = json.loads(raw_body)
     except ValueError:
+        event = {}
+    event_type = event.get("type") or ("unknown" if is_valid else "invalid_signature")
+    txn_id_guess = _webhook_txn_id(event) or "unknown"
+
+    if not is_valid:
+        logger.warning("Rejected webhook POST with invalid signature: %s", sig_detail)
+        record_webhook_event(event_type, txn_id_guess, event or {"raw_body_preview": raw_body[:500].decode("utf-8", "replace")},
+                              signature_detail=sig_detail)
+        return JSONResponse({"error": "invalid signature", "detail": sig_detail}, status_code=401)
+
+    if not event:
         logger.warning("Webhook POST body wasn't valid JSON (signature check: %s)", sig_detail)
+        record_webhook_event("invalid_json", "unknown", {"raw_body_preview": raw_body[:500].decode("utf-8", "replace")},
+                              signature_detail=sig_detail)
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    event_type = event.get("type") or "unknown"
     # Record receipt unconditionally (even without credentials or a
     # recognizable txn id) so the Setup panel can confirm "yes, Sumsub is
     # reaching this URL" independently of whether ingestion succeeds. This
     # is a single fast local DB write, not an API call, so it's safe to do
     # before responding.
-    row_id = record_webhook_event(event_type, _webhook_txn_id(event) or "unknown", event)
+    row_id = record_webhook_event(event_type, txn_id_guess, event, signature_detail=sig_detail)
     background_tasks.add_task(_process_webhook_event_in_background, event, row_id)
     return {"received": True, "signature": sig_detail}
 
@@ -2221,6 +2482,15 @@ FRONTEND_HTML = r"""<!doctype html>
         <ul class="narrative" id="narrative"></ul>
         <div id="categoricalBars" style="margin-top:16px;"></div>
         <div id="rawTagsDiag" style="margin-top:16px;"></div>
+        <div id="reviewStatusDiag" style="margin-top:16px;"></div>
+      </div>
+    </details>
+
+    <details class="section-collapse">
+      <summary>Recent webhook activity</summary>
+      <div class="details-body">
+        <p class="desc">The last 15 requests to the webhook endpoint, in detail -- the primary place to look when "the webhook isn't updating live." Shows exactly what type each event was, whether it passed signature verification, and whether ingestion succeeded.</p>
+        <div id="recentWebhooksDiag"></div>
       </div>
     </details>
 
@@ -2303,6 +2573,12 @@ function renderSetup(s) {
   if (s.webhook_missing_txn_created) {
     rows.push({icon: "warn", text: `<strong>Webhook events are arriving, but never "applicantKytTxnCreated"</strong> -- the specific event Sumsub sends the moment a brand-new transaction is first created. Sumsub only sends event types you've explicitly enabled in <strong>Dashboard &rarr; Webhook manager</strong>; without this one, new transactions won't show up here in real time until some later event (review/approval/rejection) happens to fire instead. Edit the webhook in Sumsub's dashboard and make sure the "Txn created" event type is checked. Event types actually seen so far: ${(s.webhook_event_types||[]).map(e => `<span class="pill">${e.event_type} &times;${e.count}</span>`).join(" ") || "none"}.`});
   }
+  if ((s.webhook_types_fully_sig_failing||[]).length) {
+    rows.push({icon: "crit", text: `<strong>Sumsub IS sending ${s.webhook_types_fully_sig_failing.join(", ")}, but every single one is failing signature verification.</strong> This means the webhook connection itself works, but <code>SUMSUB_WEBHOOK_SECRET_KEY</code> in Render doesn't match the secret currently shown in Sumsub Dashboard &rarr; Webhook manager for this webhook -- a config mismatch, not a delivery problem. Copy the secret shown there again (it may have been regenerated) into Render and redeploy. Check "Recent webhook activity" below for the exact per-event detail.`});
+  }
+  if (s.total_still_open_pending > 0 && s.total_bank_rfi > 0 && s.total_confirmed_other < 3) {
+    rows.push({icon: "warn", text: `<strong>${s.total_still_open_pending.toLocaleString()} transaction(s) are still open/pending review, and only ${s.total_confirmed_other} have a CONCLUDED review without the "${s.bank_rfi_tag}" tag.</strong> Risk scores will sit near 0% for every candidate until more transactions finish review (approved/rejected/reviewed on Sumsub) -- the model needs confirmed "not risky" examples to compare against, not just confirmed "risky" ones, and an open/pending transaction's real outcome isn't known yet so it can't be used as either. This resolves itself automatically as more reviews conclude; no configuration issue here.`});
+  }
   if (s.db_likely_ephemeral && s.total_transactions > 0) {
     rows.push({icon: "warn", text: `<strong>No persistent disk detected</strong> (db path: <code>${s.db_path}</code>). On Render's Free/Starter plans this file resets on every restart/redeploy, so the counts below can drop back to 0 after a deploy even though nothing is broken -- the bot just auto-refills via a historical backfill on the next startup (see above) or as new webhook events arrive. Add a Render Disk mounted at <code>/data</code> with <code>BOT_DB_PATH=/data/bank_rfi_bot.db</code> to stop this from happening -- see the README's "Deploying on Render" section.`});
   }
@@ -2317,6 +2593,8 @@ function renderSetup(s) {
   banner.style.display = "block";
   banner.innerHTML = `<h2>${allGood ? "Status" : "Setup"}</h2>${rows.map(r => `<div class="setup-row"><span class="setup-icon ${r.icon}">${r.icon === "good" ? "&#10003;" : "!"}</span><span>${r.text}</span></div>`).join("")}`;
   renderRawTagsDiag(s.distinct_tags_seen || [], s.bank_rfi_tag);
+  renderReviewStatusDiag(s.distinct_review_statuses_seen || []);
+  renderRecentWebhooks(s.recent_webhook_events || []);
 }
 
 function renderRawTagsDiag(tags, expectedTag) {
@@ -2329,6 +2607,42 @@ function renderRawTagsDiag(tags, expectedTag) {
   el.innerHTML = `
     <p class="desc" style="margin-bottom:6px;"><strong>Every raw tag label seen so far</strong> (diagnostic -- compare against the expected tag "${expectedTag}" below; a mismatched spelling/separator here is the fastest way to spot why a transaction you know is tagged isn't counted as bank-rfi).</p>
     <div>${tags.map(t => `<span class="pill" style="${t.matches_bank_rfi ? 'border-color:var(--status-good);color:var(--status-good);' : ''}">${t.tag} &times;${t.count}${t.matches_bank_rfi ? ' (matches)' : ''}</span>`).join(" ")}</div>
+  `;
+}
+
+function renderReviewStatusDiag(statuses) {
+  const el = document.getElementById("reviewStatusDiag");
+  if (!el) return;
+  if (!statuses.length) {
+    el.innerHTML = '<p class="empty">No transactions ingested yet.</p>';
+    return;
+  }
+  el.innerHTML = `
+    <p class="desc" style="margin-bottom:6px;"><strong>Every review_status value actually seen so far</strong> (diagnostic -- "open" statuses are excluded from training as negative examples until they conclude; see "How the model works" in the README). "(none/missing)" here for every transaction usually means this field isn't being read correctly for your account's data shape -- worth reporting if so.</p>
+    <div>${statuses.map(s => `<span class="pill" style="${s.counts_as_open ? '' : 'border-color:var(--status-good);color:var(--status-good);'}">${s.review_status} &times;${s.count} (${s.counts_as_open ? "open -- excluded" : "resolved -- counted"})</span>`).join(" ")}</div>
+  `;
+}
+
+function renderRecentWebhooks(events) {
+  const el = document.getElementById("recentWebhooksDiag");
+  if (!el) return;
+  if (!events.length) {
+    el.innerHTML = '<p class="empty">No webhook requests received yet.</p>';
+    return;
+  }
+  el.innerHTML = `
+    <table id="recentWebhooksTable">
+      <thead><tr><th>Received</th><th>Event type</th><th>Txn ID</th><th>Ingested?</th><th>Signature</th><th>Detail</th></tr></thead>
+      <tbody>${events.map(e => `
+        <tr>
+          <td>${(e.received_at||"").replace("T"," ").slice(0,19)}</td>
+          <td>${e.event_type}</td>
+          <td>${e.kyt_txn_id}</td>
+          <td>${e.processed ? "&#10003;" : "&#10005;"}</td>
+          <td style="max-width:220px;">${e.signature_detail || "–"}</td>
+          <td style="max-width:260px;">${e.process_detail || "–"}</td>
+        </tr>`).join("")}</tbody>
+    </table>
   `;
 }
 
