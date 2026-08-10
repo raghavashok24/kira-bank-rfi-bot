@@ -12,6 +12,24 @@ retrains the instant a webhook event comes in from Sumsub, so the risk
 picture stays current within seconds of something changing on your account,
 not on a schedule.
 
+## Contents
+
+- [What it actually does](#what-it-actually-does)
+- [Repo layout](#repo-layout)
+- [Quick start](#quick-start)
+- [Credentials](#credentials)
+- [How data gets in](#how-data-gets-in)
+- [How the model works](#how-the-model-works)
+- [The dashboard](#the-dashboard)
+- [Deploying on Render](#deploying-on-render)
+- [Environment variables reference](#environment-variables-reference)
+- [Running it locally](#running-it-locally)
+- [Trying it before real Sumsub data is connected](#trying-it-before-real-sumsub-data-is-connected)
+- [Securing the webhook](#securing-the-webhook)
+- [Security notes](#security-notes)
+- [API reference](#api-reference)
+- [Troubleshooting](#troubleshooting)
+
 ## What it actually does
 
 Every transaction the bot ever learns from was fetched from the real Sumsub
@@ -222,6 +240,41 @@ shown on the dashboard's "Model mode" tile and in the model history table,
 so "is this actually predicting anything" has an answer you can point to
 instead of just trusting the label.
 
+**Bank-rfi is a genuinely rare event, and training accounts for that
+explicitly.** A real account typically has on the order of a few dozen
+confirmed "bank rfi" examples against a much larger pool of confirmed-clean
+ones — real class imbalance, not just a small dataset. Three things handle
+this: `class_weight="balanced"` reweights the training loss so the rare
+positive class isn't drowned out by the majority class; `StratifiedKFold`
+is used everywhere folding happens (both the calibration step and the CV
+metrics below) so every fold keeps the true bank-rfi ratio instead of
+risking a fold with zero positives; and **precision-recall AUC (PR-AUC) is
+computed and shown alongside ROC-AUC**, because ROC-AUC alone can look
+misleadingly strong under imbalance — it partly rewards correctly ranking
+the many easy true negatives, which isn't the hard part. PR-AUC specifically
+measures how well the model finds the rare positives, which is what an
+early-warning system is actually for. Both numbers, plus the training set's
+positive rate for context, are on the dashboard and in `GET
+/api/model/history`.
+
+**A real train/test split, not just cross-validation.** In addition to the
+random k-fold CV above, every ML-mode retrain also computes a *chronological
+holdout*: it sorts every confirmed labeled example by its own transaction
+date, trains a separate classifier only on the oldest ~80%, and evaluates it
+on the newest ~20% — data never seen during training or during the scaler's
+fit, avoiding even the subtle preprocessing leakage a shared scaler would
+introduce. This directly answers "would this model have caught last month's
+bank-rfi cases using only what was known before them", which random CV
+(which shuffles across all of history) can't tell you on its own. A much
+lower score here than the CV numbers is the clearest signal that recent
+transaction patterns have drifted from older ones. This holdout is
+evaluation-only — it doesn't shrink the training set the deployed model
+actually uses, since with only a few dozen positives, permanently holding
+data back would cost more than it's worth. When there isn't yet enough data
+on both sides of a chronological split (at least 5 of each class in both the
+train and test slices), the dashboard says so explicitly instead of showing
+a number computed from too few examples to mean anything.
+
 **Every score comes with an explanation, never a bare number.** For each
 open transaction: the specific statistically-significant patterns it
 matches (e.g. `"amount" is significantly higher in bank-rfi transactions
@@ -275,6 +328,37 @@ flagging this and how did the score move over time" for any transaction,
 and `GET /api/predictions/log` shows the most recent scoring activity
 across the whole account — a durable audit trail independent of whatever
 `/api/predictions` happens to compute live right now.
+
+**Retraining is always on the complete history, and a process restart
+doesn't start over.** Two related but different things are worth
+separating here. First: every retrain (triggered by a webhook event, the
+hourly safety-net job, or a manual "run ingestion now") always fits fresh
+on 100% of the transactions currently in the database — not an
+incremental/partial update layered on top of a stale prior model. For a
+dataset this size (tens of confirmed positives, not millions of rows) a
+full batch fit is the statistically correct choice, not a shortcut: it
+means "a new transaction was ingested" always implies "the very next
+retrain sees it, along with everything else that's ever been ingested",
+with no risk of the model quietly drifting from what the database actually
+contains. Second, and this is what "starting over" usually really means in
+practice: the trained model itself (classifier, scaler, vocabulary, pattern
+findings) is now cached in the database (`model_state` table) every time a
+retrain finishes, and restored from there the instant the process starts
+back up (`GET`-ing the dashboard right after a Render redeploy or a
+free-tier spin-up no longer shows "untrained" while a fresh retrain runs —
+it shows the model that was already learned). The normal retrain cycle
+still runs exactly as before on top of that and will replace the cached
+model with a fully current one the moment new data justifies it — this
+cache only closes the gap between process start and that first retrain. One
+caveat worth being explicit about: `model_state` lives in the same SQLite
+file as `transactions`. On a platform with no persistent disk (see
+"Deploying on Render" above), a real restart wipes both together, and this
+cache can't survive that — only a persistent disk (or Sumsub itself, via the
+existing auto-backfill-on-empty-database recovery) can make the underlying
+transaction history durable across that kind of restart. What this cache
+*does* solve is the more common case of a soft restart where the disk
+survives: the model resumes immediately instead of retraining from a blank
+slate every single time.
 
 ## The dashboard
 
