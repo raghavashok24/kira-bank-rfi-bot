@@ -1,4 +1,4 @@
-# Bank RFI Prediction Bot
+# Bank RFI Prediction Bot --- Kira
 
 Predicts which Sumsub transactions are likely to receive a **bank RFI** (a bank's
 after-the-fact Request For Information), before the bank actually sends one.
