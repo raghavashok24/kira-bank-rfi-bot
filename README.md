@@ -10,7 +10,7 @@ Everything is one file (`server.py`): the Sumsub API client, SQLite persistence,
 feature engineering, the model, ingestion, the FastAPI routes, and the embedded
 dashboard.
 
-## How to Run this Bot
+## Where this Bot Runs
 
 It is designed for a machine with a **persistent filesystem** — not an
 ephemeral-disk PaaS. The SQLite database (`bank_rfi_bot.db`, created next to
