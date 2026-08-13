@@ -1,4 +1,4 @@
-# Bank RFI Prediction Bot --- Kira
+# Bank RFI Prediction Bot
 
 Predicts which Sumsub transactions are likely to receive a **bank RFI** (a bank's
 after-the-fact Request For Information), before the bank actually sends one.
@@ -10,7 +10,7 @@ Everything is one file (`server.py`): the Sumsub API client, SQLite persistence,
 feature engineering, the model, ingestion, the FastAPI routes, and the embedded
 dashboard.
 
-## How to Run this Bot
+## This bot runs locally
 
 It is designed for a machine with a **persistent filesystem** — not an
 ephemeral-disk PaaS. The SQLite database (`bank_rfi_bot.db`, created next to
@@ -93,12 +93,21 @@ and everything else works the same.
 `bank rfi` is a genuinely rare event — on the order of ~40 positives against
 the company's full transaction history. The model is built around that:
 
-- **Calibrated logistic regression** (`class_weight="balanced"`, sigmoid
-  calibration via `CalibratedClassifierCV` with stratified folds) — the right
-  capacity for a few dozen positives; anything bigger just memorizes them.
-- **Regularization strength chosen per-retrain**: C is picked from a small
-  grid by stratified-CV **PR-AUC** (the metric that matters under class
-  imbalance), not hard-coded.
+- **Shallow gradient-boosted trees** (`HistGradientBoostingClassifier`,
+  depth ≤ 3, `class_weight="balanced"`) — chosen over logistic regression on
+  measured out-of-fold results against real data (~3x the PR-AUC), because
+  RFI risk lives in feature *interactions* (large AND outbound AND
+  thin-history), which a linear model cannot express. Depth stays capped so
+  ~40 positives can't be memorized.
+- **Scores are relative profile-match scores, not calibrated frequencies** —
+  deliberate: with a ~0.6% base rate, calibrated probabilities compress every
+  score into 0–2% (even confirmed RFI cases), making dashboards unreadable
+  and alert thresholds meaningless. A score near 1 means "strongly matches
+  the historical RFI profile".
+- **A logistic regression rides along purely for explainability** (its
+  regularization picked per-retrain by stratified-CV PR-AUC) — its
+  coefficients power the feature-importance panel; it never produces the
+  served score.
 - **One-hot vocabularies capped** (`MAX_CATEGORICAL_VOCAB`) so dozens of
   country/currency values can't blow up dimensionality past what ~40
   positives support.
