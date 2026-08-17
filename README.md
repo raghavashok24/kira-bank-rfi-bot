@@ -1,4 +1,9 @@
-# Bank RFI Prediction Bot
+div align="center">
+  <br/>
+  <img src="https://img.shields.io/badge/Kira_Financial_AI-AML_Bot-1A56DB?style=for-the-badge&labelColor=0D1117" alt="Kira AML Bot"/>
+  <br/><br/>
+
+# Apex - Bank RFI Prediction Bot
 
 Predicts which Sumsub transactions are likely to receive a **bank RFI** (a bank's
 after-the-fact Request For Information), before the bank actually sends one.
