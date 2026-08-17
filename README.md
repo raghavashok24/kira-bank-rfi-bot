@@ -1,4 +1,3 @@
-div align="center">
   <br/>
   <img src="https://img.shields.io/badge/Kira_Financial_AI-AML_Bot-1A56DB?style=for-the-badge&labelColor=0D1117" alt="Kira AML Bot"/>
   <br/><br/>
